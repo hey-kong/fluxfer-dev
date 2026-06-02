@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
@@ -706,12 +707,11 @@ std::vector<int64_t> get_chunked_main_pages(const at::Tensor& host_indices, int6
   const auto* indices = host_indices_cpu.data_ptr<int64_t>();
   std::vector<int64_t> pages;
   pages.reserve(host_indices_cpu.numel() / main_page_size + 1);
-  int64_t previous = -1;
+  std::unordered_set<int64_t> seen_pages;
   for (int64_t i = 0; i < host_indices_cpu.numel(); ++i) {
     const int64_t page = indices[i] / main_page_size;
-    if (page != previous) {
+    if (seen_pages.insert(page).second) {
       pages.push_back(page);
-      previous = page;
     }
   }
   return pages;
