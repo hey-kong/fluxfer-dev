@@ -561,6 +561,21 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+void transfer_kv_all_layer_chunked_lf_pf(
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t main_page_size);
+
+void transfer_kv_per_layer_chunked_pf_lf(
+    const std::vector<at::Tensor>& src_ptrs,
+    std::vector<at::Tensor> dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t main_page_size);
+
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,

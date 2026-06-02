@@ -70,7 +70,14 @@ class HiRadixCache(RadixCache):
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
+        # Keep radix-tree and HBM metadata at the device page granularity.  The
+        # chunked backend only widens the DRAM-side allocation/I/O granularity.
         self.page_size = params.page_size
+        self.main_page_size = (
+            server_args.main_page_size
+            if server_args.hicache_io_backend == "chunked"
+            else self.page_size
+        )
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -78,7 +85,7 @@ class HiRadixCache(RadixCache):
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                self.main_page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
@@ -90,7 +97,7 @@ class HiRadixCache(RadixCache):
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                self.main_page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
@@ -138,7 +145,7 @@ class HiRadixCache(RadixCache):
             self.cache_controller = HiCacheController(
                 params.token_to_kv_pool_allocator,
                 self.token_to_kv_pool_host,
-                self.page_size,
+                self.main_page_size,
                 self.tp_group,
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
@@ -682,6 +689,14 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
+        if (
+            self.cache_controller.io_backend == "chunked"
+            and len(node.value) % self.main_page_size != 0
+        ):
+            # DRAM metadata is chunk-granular.  A short radix node remains an
+            # HBM-only entry until it can be represented by complete main pages.
+            return 0
+
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
@@ -1473,13 +1488,22 @@ class HiRadixCache(RadixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
 
-        if len(key):
+        while len(key):
+            # Chunked DRAM metadata is main-page based, while the radix tree
+            # still matches and indexes HBM pages.  Materialize full main-page
+            # nodes where possible so write-through can offload them without
+            # widening the HBM allocator granularity.
+            segment_len = (
+                min(len(key), self.main_page_size)
+                if self.cache_controller.io_backend == "chunked"
+                else len(key)
+            )
             new_node = TreeNode(priority=priority)
             new_node.parent = node
-            new_node.key = key
-            new_node.value = value.clone()
+            new_node.key = key[:segment_len]
+            new_node.value = value[:segment_len].clone()
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            self.evictable_size_ += segment_len
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
 
@@ -1492,6 +1516,12 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
+
+            node = new_node
+            key = key[segment_len:]
+            value = value[segment_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):

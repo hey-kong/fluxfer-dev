@@ -180,6 +180,31 @@ def transfer_kv_all_layer_lf_ph(
     )
 
 
+def transfer_kv_all_layer_chunked_lf_pf(
+    src_layers: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    main_page_size: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_chunked_lf_pf.default(
+        src_layers, dst_ptrs, src_indices, dst_indices, main_page_size
+    )
+
+
+def transfer_kv_per_layer_chunked_pf_lf(
+    src_ptrs: List[torch.Tensor],
+    dst_layers: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    main_page_size: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_chunked_pf_lf.default(
+        src_ptrs, dst_layers, src_indices, dst_indices, layer_id, main_page_size
+    )
+
+
 def transfer_kv_direct(
     src_layers: List[torch.Tensor],
     dst_layers: List[torch.Tensor],

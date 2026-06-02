@@ -4,7 +4,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
@@ -672,6 +674,159 @@ void transfer_kv_all_layer_mla_lf_pf(
       empty,
       block_quota,
       num_warps_per_block);
+}
+
+__global__ void
+gather_kv_chunk_kernel(const char* src, char* dst, const int64_t* src_indices, int64_t num_tokens, int64_t item_size) {
+  const int64_t token = blockIdx.x;
+  for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
+    dst[token * item_size + byte] = src[src_indices[token] * item_size + byte];
+  }
+}
+
+__global__ void scatter_kv_chunk_kernel(
+    const char* src,
+    char* dst,
+    const int64_t* streaming_indices,
+    const int64_t* dst_indices,
+    int64_t num_tokens,
+    int64_t item_size) {
+  const int64_t token = blockIdx.x;
+  for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
+    dst[dst_indices[token] * item_size + byte] = src[streaming_indices[token] * item_size + byte];
+  }
+}
+
+std::vector<int64_t> get_chunked_main_pages(const at::Tensor& host_indices, int64_t main_page_size) {
+  auto host_indices_cpu = host_indices.cpu();
+  const auto* indices = host_indices_cpu.data_ptr<int64_t>();
+  std::vector<int64_t> pages;
+  pages.reserve(host_indices_cpu.numel() / main_page_size + 1);
+  int64_t previous = -1;
+  for (int64_t i = 0; i < host_indices_cpu.numel(); ++i) {
+    const int64_t page = indices[i] / main_page_size;
+    if (page != previous) {
+      pages.push_back(page);
+      previous = page;
+    }
+  }
+  return pages;
+}
+
+void transfer_kv_all_layer_chunked_lf_pf(
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t main_page_size) {
+  TORCH_CHECK(main_page_size > 0, "main_page_size must be positive");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+  TORCH_CHECK(src_indices.numel() % main_page_size == 0, "Chunked stores must contain complete DRAM main pages");
+  const int64_t num_kv = dst_ptrs.size();
+  TORCH_CHECK(num_kv == 1 || num_kv == 2, "Chunked transfer expects one MLA or two MHA host buffers");
+  TORCH_CHECK(src_layers.size() % num_kv == 0, "Invalid source layer count");
+  const int64_t num_layers = src_layers.size() / num_kv;
+  const int64_t num_tokens = src_indices.numel();
+  if (num_tokens == 0) return;
+  auto main_pages = get_chunked_main_pages(dst_indices, main_page_size);
+  TORCH_CHECK(
+      main_pages.size() * main_page_size == num_tokens, "Chunked stores require complete contiguous DRAM main pages");
+  auto dst_indices_cpu = dst_indices.cpu();
+  const auto* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+  for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+    const int64_t first = dst_indices_ptr[page * main_page_size];
+    TORCH_CHECK(first % main_page_size == 0, "Chunked stores require main-page-aligned host indices");
+    for (int64_t token = 0; token < main_page_size; ++token) {
+      TORCH_CHECK(
+          dst_indices_ptr[page * main_page_size + token] == first + token,
+          "Chunked stores require contiguous host main pages");
+    }
+  }
+  const int64_t item_size = src_layers[0].stride(0) * src_layers[0].element_size();
+  auto options = at::TensorOptions().dtype(at::kByte).device(src_layers[0].device());
+  auto streaming =
+      at::empty({num_kv, static_cast<int64_t>(main_pages.size()), num_layers, main_page_size, item_size}, options);
+  auto src_indices_device = src_indices.to(src_layers[0].device(), /*non_blocking=*/true);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  for (int64_t kv = 0; kv < num_kv; ++kv) {
+    for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+      for (int64_t layer = 0; layer < num_layers; ++layer) {
+        const auto& src = src_layers[kv * num_layers + layer];
+        char* stream_ptr = streaming[kv][page][layer].data_ptr<char>();
+        gather_kv_chunk_kernel<<<main_page_size, 256, 0, stream>>>(
+            static_cast<const char*>(src.data_ptr()),
+            stream_ptr,
+            src_indices_device.data_ptr<int64_t>() + page * main_page_size,
+            main_page_size,
+            item_size);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      }
+      const int64_t bytes = main_page_size * num_layers * item_size;
+      const char* src = streaming[kv][page].data_ptr<char>();
+      char* dst = static_cast<char*>(dst_ptrs[kv].data_ptr()) + main_pages[page] * bytes;
+      C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream));
+    }
+  }
+}
+
+void transfer_kv_per_layer_chunked_pf_lf(
+    const std::vector<at::Tensor>& src_ptrs,
+    std::vector<at::Tensor> dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t main_page_size) {
+  TORCH_CHECK(main_page_size > 0, "main_page_size must be positive");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+  const int64_t num_kv = src_ptrs.size();
+  TORCH_CHECK(num_kv == 1 || num_kv == 2, "Chunked transfer expects one MLA or two MHA host buffers");
+  TORCH_CHECK(dst_layers.size() == num_kv, "Invalid destination layer count");
+  const int64_t num_tokens = src_indices.numel();
+  if (num_tokens == 0) return;
+  auto main_pages = get_chunked_main_pages(src_indices, main_page_size);
+  const int64_t expanded_tokens = main_pages.size() * main_page_size;
+  const int64_t item_size = dst_layers[0].stride(0) * dst_layers[0].element_size();
+  auto options = at::TensorOptions().dtype(at::kByte).device(dst_layers[0].device());
+  auto streaming = at::empty({num_kv, expanded_tokens, item_size}, options);
+  auto src_indices_cpu = src_indices.cpu();
+  const auto* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  std::unordered_map<int64_t, int64_t> page_to_stream;
+  for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+    page_to_stream[main_pages[page]] = page;
+  }
+  std::vector<int64_t> streaming_indices(num_tokens);
+  for (int64_t token = 0; token < num_tokens; ++token) {
+    const int64_t main_page = src_indices_ptr[token] / main_page_size;
+    streaming_indices[token] = page_to_stream.at(main_page) * main_page_size + src_indices_ptr[token] % main_page_size;
+  }
+  auto streaming_indices_cpu = at::empty({num_tokens}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  std::memcpy(streaming_indices_cpu.data_ptr<int64_t>(), streaming_indices.data(), num_tokens * sizeof(int64_t));
+  auto streaming_indices_device = streaming_indices_cpu.to(dst_layers[0].device(), /*non_blocking=*/true);
+  auto dst_indices_device = dst_indices.to(dst_layers[0].device(), /*non_blocking=*/true);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t host_layer_stride = src_ptrs[0].stride(1) * src_ptrs[0].element_size();
+  const int64_t host_page_stride = src_ptrs[0].stride(0) * src_ptrs[0].element_size();
+  for (int64_t kv = 0; kv < num_kv; ++kv) {
+    char* stream_ptr = streaming[kv].data_ptr<char>();
+    for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+      const char* src = static_cast<const char*>(src_ptrs[kv].data_ptr()) + main_pages[page] * host_page_stride +
+                        layer_id * host_layer_stride;
+      C10_CUDA_CHECK(cudaMemcpyAsync(
+          stream_ptr + page * main_page_size * item_size,
+          src,
+          main_page_size * item_size,
+          cudaMemcpyHostToDevice,
+          stream));
+    }
+    scatter_kv_chunk_kernel<<<num_tokens, 256, 0, stream>>>(
+        stream_ptr,
+        static_cast<char*>(dst_layers[kv].data_ptr()),
+        streaming_indices_device.data_ptr<int64_t>(),
+        dst_indices_device.data_ptr<int64_t>(),
+        num_tokens,
+        item_size);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 inline void transfer_page_direct(

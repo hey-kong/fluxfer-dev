@@ -764,7 +764,7 @@ class HiCacheController:
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
-        elif self.io_backend == "direct":
+        elif self.io_backend in ["direct", "chunked"]:
             if self.mem_pool_host.layout == "layer_first":
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
@@ -773,7 +773,7 @@ class HiCacheController:
                 return host_indices, device_indices.cpu()
             else:
                 raise ValueError(
-                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend {self.io_backend!r}"
                 )
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
