@@ -1,4 +1,8 @@
+#include <ATen/ATen.h>
+#include <ATen/Functions.h>
+#include <ATen/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
