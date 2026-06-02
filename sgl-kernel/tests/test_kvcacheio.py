@@ -730,7 +730,10 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
         list(range(8, 16)) + list(range(24, 32)), dtype=torch.int64
     )
     host_indices = torch.arange(0, 16, dtype=torch.int64)
-    partial_host_indices = torch.tensor([1, 2, 5, 9, 14], dtype=torch.int64)
+    # Exercise partial retrieval with non-contiguous, out-of-order indices and
+    # a repeated token. The H2D path should stage each referenced main page once
+    # while scattering only the requested tokens into the destination pool.
+    partial_host_indices = torch.tensor([9, 1, 14, 2, 9], dtype=torch.int64)
     partial_device_indices = torch.tensor([0, 3, 6, 17, 19], dtype=torch.int64)
 
     if is_mla:
