@@ -46,6 +46,7 @@ _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
+        transfer_kv_all_layer_chunked_lf_pf,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
@@ -53,6 +54,7 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
         transfer_kv_per_layer,
+        transfer_kv_per_layer_chunked_pf_lf,
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
@@ -265,6 +267,7 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self._pending_free_slots = set()
 
     def available_size(self):
         return len(self.free_slots)
@@ -284,7 +287,23 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        # Radix-tree nodes can be split at the finer HBM page granularity after
+        # a DRAM main page has been stored.  Keep partial releases pending and
+        # return a DRAM page to the allocator only after every token in that
+        # page has been released.
+        self._pending_free_slots.update(indices.cpu().tolist())
+        released_pages = []
+        touched_pages = {index // self.page_size for index in self._pending_free_slots}
+        for page in touched_pages:
+            start = page * self.page_size
+            page_slots = range(start, start + self.page_size)
+            if all(slot in self._pending_free_slots for slot in page_slots):
+                released_pages.extend(page_slots)
+                self._pending_free_slots.difference_update(page_slots)
+        if released_pages:
+            self.free_slots = torch.cat(
+                [self.free_slots, torch.tensor(released_pages, dtype=torch.int64)]
+            )
         return len(indices)
 
 
@@ -466,6 +485,20 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "chunked":
+            if self.layout != "page_first_direct":
+                raise ValueError("Chunked IO backend requires page_first_direct layout")
+            transfer_kv_per_layer_chunked_pf_lf(
+                src_ptrs=[self.k_buffer, self.v_buffer],
+                dst_layers=[
+                    device_pool.k_buffer[layer_id],
+                    device_pool.v_buffer[layer_id],
+                ],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                main_page_size=self.page_size,
+            )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
@@ -582,6 +615,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "chunked":
+            if self.layout != "page_first_direct":
+                raise ValueError("Chunked IO backend requires page_first_direct layout")
+            transfer_kv_all_layer_chunked_lf_pf(
+                src_layers=device_pool.k_buffer + device_pool.v_buffer,
+                dst_ptrs=[self.k_buffer, self.v_buffer],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                main_page_size=self.page_size,
+            )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
@@ -964,6 +1007,17 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "chunked":
+            if self.layout != "page_first_direct":
+                raise ValueError("Chunked IO backend requires page_first_direct layout")
+            transfer_kv_per_layer_chunked_pf_lf(
+                src_ptrs=[self.kv_buffer],
+                dst_layers=[device_pool.kv_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                main_page_size=self.page_size,
+            )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
@@ -1052,6 +1106,16 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "chunked":
+            if self.layout != "page_first_direct":
+                raise ValueError("Chunked IO backend requires page_first_direct layout")
+            transfer_kv_all_layer_chunked_lf_pf(
+                src_layers=device_pool.kv_buffer,
+                dst_ptrs=[self.kv_buffer],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                main_page_size=self.page_size,
+            )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(

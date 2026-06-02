@@ -183,6 +183,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
   m.def(
+      "transfer_kv_all_layer_chunked_lf_pf(Tensor[] src_layers, Tensor[] dst_ptrs, Tensor src_indices, "
+      "Tensor dst_indices, int main_page_size) -> ()");
+  m.impl("transfer_kv_all_layer_chunked_lf_pf", torch::kCUDA, &transfer_kv_all_layer_chunked_lf_pf);
+  m.def(
+      "transfer_kv_per_layer_chunked_pf_lf(Tensor[] src_ptrs, Tensor[] dst_layers, Tensor src_indices, "
+      "Tensor dst_indices, int layer_id, int main_page_size) -> ()");
+  m.impl("transfer_kv_per_layer_chunked_pf_lf", torch::kCUDA, &transfer_kv_per_layer_chunked_pf_lf);
+  m.def(
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);

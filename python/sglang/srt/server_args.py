@@ -662,6 +662,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
+    main_page_size: int = 256
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
@@ -3474,6 +3475,31 @@ class ServerArgs:
             self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
+        if self.hicache_io_backend == "chunked":
+            if self.hicache_mem_layout != "page_first_direct":
+                raise ValueError(
+                    "--hicache-io-backend chunked requires "
+                    "--hicache-mem-layout page_first_direct"
+                )
+            if self.hicache_write_policy != "write_through":
+                raise ValueError(
+                    "--hicache-io-backend chunked requires "
+                    "--hicache-write-policy write_through"
+                )
+            if self.hicache_storage_backend is not None:
+                raise ValueError(
+                    "--hicache-io-backend chunked currently manages DRAM main pages "
+                    "only and cannot be combined with --hicache-storage-backend"
+                )
+            if self.main_page_size <= 0:
+                raise ValueError("--main-page-size must be positive")
+            if self.main_page_size % self.page_size != 0:
+                raise ValueError(
+                    "--main-page-size must be divisible by --page-size when "
+                    "--hicache-io-backend is chunked"
+                )
+            return
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -6244,6 +6270,12 @@ class ServerArgs:
             help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         )
         parser.add_argument(
+            "--main-page-size",
+            type=int,
+            default=ServerArgs.main_page_size,
+            help="The DRAM chunk size in tokens for the chunked HiCache IO backend.",
+        )
+        parser.add_argument(
             "--hicache-write-policy",
             type=str,
             choices=["write_back", "write_through", "write_through_selective"],
@@ -6253,7 +6285,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "chunked"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )

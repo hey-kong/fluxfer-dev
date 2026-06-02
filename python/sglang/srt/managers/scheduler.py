@@ -1031,7 +1031,7 @@ class Scheduler(
         kw = dict(
             host_to_device_ratio=primary.size / pool.size,
             host_size=0,
-            page_size=self.page_size,
+            page_size=primary.page_size,
             layout=self.server_args.hicache_mem_layout,
         )
         if isinstance(pool, MHATokenToKVPool):

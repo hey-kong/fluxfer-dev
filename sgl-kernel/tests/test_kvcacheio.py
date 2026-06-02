@@ -711,5 +711,84 @@ def test_transfer_kv_page_head(
     torch.set_default_dtype(original_dtype)
 
 
+@pytest.mark.skipif(
+    is_hip(), reason="Chunked HiCache CUDA path is tested on NVIDIA CUDA"
+)
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
+    from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_chunked_lf_pf,
+        transfer_kv_per_layer_chunked_pf_lf,
+    )
+
+    device = "cuda"
+    num_layers = 2
+    main_page_size = 8
+    total_tokens = 32
+    item_size = 16
+    stored_device_indices = torch.tensor(
+        list(range(8, 16)) + list(range(24, 32)), dtype=torch.int64
+    )
+    host_indices = torch.arange(0, 16, dtype=torch.int64)
+    partial_host_indices = torch.tensor([1, 2, 5, 9, 14], dtype=torch.int64)
+    partial_device_indices = torch.tensor([0, 3, 6, 17, 19], dtype=torch.int64)
+
+    if is_mla:
+        src = torch.randn(num_layers, total_tokens, item_size, device=device)
+        host = torch.zeros(2, num_layers, main_page_size, item_size).pin_memory()
+        transfer_kv_all_layer_chunked_lf_pf(
+            [src[layer] for layer in range(num_layers)],
+            [host],
+            stored_device_indices,
+            host_indices,
+            main_page_size,
+        )
+        out = torch.zeros_like(src)
+        for layer in range(num_layers):
+            transfer_kv_per_layer_chunked_pf_lf(
+                [host],
+                [out[layer]],
+                partial_host_indices,
+                partial_device_indices,
+                layer,
+                main_page_size,
+            )
+        torch.cuda.synchronize()
+        expected = src[:, stored_device_indices[partial_host_indices]]
+        torch.testing.assert_close(out[:, partial_device_indices], expected)
+    else:
+        src_k = torch.randn(num_layers, total_tokens, item_size, device=device)
+        src_v = torch.randn_like(src_k)
+        host_k = torch.zeros(2, num_layers, main_page_size, item_size).pin_memory()
+        host_v = torch.zeros_like(host_k)
+        transfer_kv_all_layer_chunked_lf_pf(
+            [src_k[layer] for layer in range(num_layers)]
+            + [src_v[layer] for layer in range(num_layers)],
+            [host_k, host_v],
+            stored_device_indices,
+            host_indices,
+            main_page_size,
+        )
+        out_k = torch.zeros_like(src_k)
+        out_v = torch.zeros_like(src_v)
+        for layer in range(num_layers):
+            transfer_kv_per_layer_chunked_pf_lf(
+                [host_k, host_v],
+                [out_k[layer], out_v[layer]],
+                partial_host_indices,
+                partial_device_indices,
+                layer,
+                main_page_size,
+            )
+        torch.cuda.synchronize()
+        expected_indices = stored_device_indices[partial_host_indices]
+        torch.testing.assert_close(
+            out_k[:, partial_device_indices], src_k[:, expected_indices]
+        )
+        torch.testing.assert_close(
+            out_v[:, partial_device_indices], src_v[:, expected_indices]
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

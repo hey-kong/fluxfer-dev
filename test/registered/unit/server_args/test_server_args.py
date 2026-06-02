@@ -447,6 +447,58 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                 )
 
+    def test_chunked_hicache_backend_requirements(self):
+        valid = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_io_backend="chunked",
+            hicache_mem_layout="page_first_direct",
+            hicache_write_policy="write_through",
+            page_size=64,
+            main_page_size=256,
+        )
+        valid._handle_hicache()
+        self._assert_hicache_fields(
+            valid,
+            expected_io_backend="chunked",
+            expected_mem_layout="page_first_direct",
+        )
+
+        invalid_overrides = [
+            {"hicache_mem_layout": "page_first"},
+            {"hicache_write_policy": "write_back"},
+            {"main_page_size": 0},
+            {"hicache_storage_backend": "file"},
+            {"page_size": 64, "main_page_size": 96},
+        ]
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                kwargs = {
+                    "enable_hierarchical_cache": True,
+                    "hicache_io_backend": "chunked",
+                    "hicache_mem_layout": "page_first_direct",
+                    "hicache_write_policy": "write_through",
+                    "page_size": 64,
+                    "main_page_size": 256,
+                }
+                kwargs.update(overrides)
+                self._make_args(**kwargs)._handle_hicache()
+
+    def test_chunked_hicache_cli_main_page_size(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-hierarchical-cache",
+                "--hicache-io-backend",
+                "chunked",
+                "--hicache-mem-layout",
+                "page_first_direct",
+                "--main-page-size",
+                "512",
+            ]
+        )
+        self.assertEqual(args.main_page_size, 512)
+
     @patch.object(ServerArgs, "use_mla_backend", return_value=False)
     @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
     def test_decode_attention_backend_with_implicit_fa3(
