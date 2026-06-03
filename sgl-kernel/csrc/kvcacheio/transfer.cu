@@ -2,11 +2,12 @@
 #include <ATen/Functions.h>
 #include <ATen/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -683,9 +684,11 @@ void transfer_kv_all_layer_mla_lf_pf(
 
 __global__ void
 gather_kv_chunk_kernel(const char* src, char* dst, const int64_t* src_indices, int64_t num_tokens, int64_t item_size) {
-  const int64_t token = blockIdx.x;
-  for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
-    dst[token * item_size + byte] = src[src_indices[token] * item_size + byte];
+  const int64_t total_bytes = num_tokens * item_size;
+  for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total_bytes; linear += gridDim.x * blockDim.x) {
+    const int64_t token = linear / item_size;
+    const int64_t byte = linear - token * item_size;
+    dst[linear] = src[src_indices[token] * item_size + byte];
   }
 }
 
@@ -696,10 +699,41 @@ __global__ void scatter_kv_chunk_kernel(
     const int64_t* dst_indices,
     int64_t num_tokens,
     int64_t item_size) {
-  const int64_t token = blockIdx.x;
-  for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
+  const int64_t total_bytes = num_tokens * item_size;
+  for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total_bytes; linear += gridDim.x * blockDim.x) {
+    const int64_t token = linear / item_size;
+    const int64_t byte = linear - token * item_size;
     dst[dst_indices[token] * item_size + byte] = src[streaming_indices[token] * item_size + byte];
   }
+}
+
+// Match the regular kvcacheio kernels' block-quota semantics so chunked
+// gather/scatter does not launch one CUDA block per token/main-page by default.
+inline int32_t
+chunked_transfer_num_blocks(int64_t num_tokens, int64_t item_size, int64_t block_quota, int64_t num_warps_per_block) {
+  TORCH_CHECK(block_quota > 0, "block_quota must be positive");
+  TORCH_CHECK(num_warps_per_block > 0, "num_warps_per_block must be positive");
+  const int64_t threads_per_block = num_warps_per_block * WARP_SIZE;
+  const int64_t total_bytes = num_tokens * item_size;
+  const int64_t blocks_for_work = (total_bytes + threads_per_block - 1) / threads_per_block;
+  return static_cast<int32_t>(std::max<int64_t>(1, std::min<int64_t>(block_quota, blocks_for_work)));
+}
+
+inline bool is_contiguous_run(const int64_t* indices, int64_t offset, int64_t length) {
+  if (length <= 0) {
+    return true;
+  }
+  const int64_t first = indices[offset];
+  for (int64_t i = 1; i < length; ++i) {
+    if (indices[offset + i] != first + i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool is_contiguous_main_page_run(const int64_t* indices, int64_t offset, int64_t main_page_size) {
+  return indices[offset] % main_page_size == 0 && is_contiguous_run(indices, offset, main_page_size);
 }
 
 std::vector<int64_t> get_chunked_main_pages(const at::Tensor& host_indices, int64_t main_page_size) {
@@ -722,7 +756,9 @@ void transfer_kv_all_layer_chunked_lf_pf(
     std::vector<at::Tensor> dst_ptrs,
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
-    int64_t main_page_size) {
+    int64_t main_page_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
   TORCH_CHECK(main_page_size > 0, "main_page_size must be positive");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   TORCH_CHECK(src_indices.numel() % main_page_size == 0, "Chunked stores must contain complete DRAM main pages");
@@ -747,6 +783,9 @@ void transfer_kv_all_layer_chunked_lf_pf(
     }
   }
   const int64_t item_size = src_layers[0].stride(0) * src_layers[0].element_size();
+  const int32_t gather_blocks =
+      chunked_transfer_num_blocks(main_page_size, item_size, block_quota, num_warps_per_block);
+  const int32_t chunked_threads_per_block = static_cast<int32_t>(num_warps_per_block * WARP_SIZE);
   auto options = at::TensorOptions().dtype(at::kByte).device(src_layers[0].device());
   auto streaming =
       at::empty({num_kv, static_cast<int64_t>(main_pages.size()), num_layers, main_page_size, item_size}, options);
@@ -757,7 +796,7 @@ void transfer_kv_all_layer_chunked_lf_pf(
       for (int64_t layer = 0; layer < num_layers; ++layer) {
         const auto& src = src_layers[kv * num_layers + layer];
         char* stream_ptr = reinterpret_cast<char*>(streaming[kv][page][layer].data_ptr());
-        gather_kv_chunk_kernel<<<main_page_size, 256, 0, stream>>>(
+        gather_kv_chunk_kernel<<<gather_blocks, chunked_threads_per_block, 0, stream>>>(
             static_cast<const char*>(src.data_ptr()),
             stream_ptr,
             src_indices_device.data_ptr<int64_t>() + page * main_page_size,
@@ -779,7 +818,9 @@ void transfer_kv_per_layer_chunked_pf_lf(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t layer_id,
-    int64_t main_page_size) {
+    int64_t main_page_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
   TORCH_CHECK(main_page_size > 0, "main_page_size must be positive");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   const int64_t num_kv = src_ptrs.size();
@@ -790,10 +831,39 @@ void transfer_kv_per_layer_chunked_pf_lf(
   auto main_pages = get_chunked_main_pages(src_indices, main_page_size);
   const int64_t expanded_tokens = main_pages.size() * main_page_size;
   const int64_t item_size = dst_layers[0].stride(0) * dst_layers[0].element_size();
-  auto options = at::TensorOptions().dtype(at::kByte).device(dst_layers[0].device());
-  auto streaming = at::empty({num_kv, expanded_tokens, item_size}, options);
+  const int32_t scatter_blocks = chunked_transfer_num_blocks(num_tokens, item_size, block_quota, num_warps_per_block);
+  const int32_t chunked_threads_per_block = static_cast<int32_t>(num_warps_per_block * WARP_SIZE);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t host_layer_stride = src_ptrs[0].stride(1) * src_ptrs[0].element_size();
+  const int64_t host_page_stride = src_ptrs[0].stride(0) * src_ptrs[0].element_size();
   auto src_indices_cpu = src_indices.cpu();
   const auto* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  auto dst_indices_cpu = dst_indices.cpu();
+  const auto* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+  bool can_direct_copy_full_pages =
+      num_tokens % main_page_size == 0 && static_cast<int64_t>(main_pages.size()) * main_page_size == num_tokens;
+  for (int64_t page = 0; can_direct_copy_full_pages && page < static_cast<int64_t>(main_pages.size()); ++page) {
+    const int64_t offset = page * main_page_size;
+    can_direct_copy_full_pages = is_contiguous_main_page_run(src_indices_ptr, offset, main_page_size) &&
+                                 is_contiguous_run(dst_indices_ptr, offset, main_page_size);
+  }
+  // Common load-back case: the host request covers whole contiguous DRAM main
+  // pages and the destination allocation is contiguous. Bypass the device
+  // staging buffer and scatter kernel while keeping main_page_size unchanged.
+  if (can_direct_copy_full_pages) {
+    for (int64_t kv = 0; kv < num_kv; ++kv) {
+      for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+        const int64_t offset = page * main_page_size;
+        const char* src = static_cast<const char*>(src_ptrs[kv].data_ptr()) + main_pages[page] * host_page_stride +
+                          layer_id * host_layer_stride;
+        char* dst = static_cast<char*>(dst_layers[kv].data_ptr()) + dst_indices_ptr[offset] * item_size;
+        C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, main_page_size * item_size, cudaMemcpyHostToDevice, stream));
+      }
+    }
+    return;
+  }
+  auto options = at::TensorOptions().dtype(at::kByte).device(dst_layers[0].device());
+  auto streaming = at::empty({num_kv, expanded_tokens, item_size}, options);
   std::unordered_map<int64_t, int64_t> page_to_stream;
   for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
     page_to_stream[main_pages[page]] = page;
@@ -807,9 +877,6 @@ void transfer_kv_per_layer_chunked_pf_lf(
   std::memcpy(streaming_indices_cpu.data_ptr<int64_t>(), streaming_indices.data(), num_tokens * sizeof(int64_t));
   auto streaming_indices_device = streaming_indices_cpu.to(dst_layers[0].device(), /*non_blocking=*/true);
   auto dst_indices_device = dst_indices.to(dst_layers[0].device(), /*non_blocking=*/true);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const int64_t host_layer_stride = src_ptrs[0].stride(1) * src_ptrs[0].element_size();
-  const int64_t host_page_stride = src_ptrs[0].stride(0) * src_ptrs[0].element_size();
   for (int64_t kv = 0; kv < num_kv; ++kv) {
     char* stream_ptr = reinterpret_cast<char*>(streaming[kv].data_ptr());
     for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
@@ -822,7 +889,7 @@ void transfer_kv_per_layer_chunked_pf_lf(
           cudaMemcpyHostToDevice,
           stream));
     }
-    scatter_kv_chunk_kernel<<<num_tokens, 256, 0, stream>>>(
+    scatter_kv_chunk_kernel<<<scatter_blocks, chunked_threads_per_block, 0, stream>>>(
         stream_ptr,
         static_cast<char*>(dst_layers[kv].data_ptr()),
         streaming_indices_device.data_ptr<int64_t>(),

@@ -186,9 +186,17 @@ def transfer_kv_all_layer_chunked_lf_pf(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     main_page_size: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_chunked_lf_pf.default(
-        src_layers, dst_ptrs, src_indices, dst_indices, main_page_size
+        src_layers,
+        dst_ptrs,
+        src_indices,
+        dst_indices,
+        main_page_size,
+        block_quota,
+        num_warps_per_block,
     )
 
 
@@ -199,9 +207,18 @@ def transfer_kv_per_layer_chunked_pf_lf(
     dst_indices: torch.Tensor,
     layer_id: int,
     main_page_size: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_chunked_pf_lf.default(
-        src_ptrs, dst_layers, src_indices, dst_indices, layer_id, main_page_size
+        src_ptrs,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        layer_id,
+        main_page_size,
+        block_quota,
+        num_warps_per_block,
     )
 
 

@@ -756,9 +756,23 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
                 layer,
                 main_page_size,
             )
+        full_out = torch.zeros_like(src)
+        full_device_indices = torch.arange(4, 20, dtype=torch.int64)
+        for layer in range(num_layers):
+            transfer_kv_per_layer_chunked_pf_lf(
+                [host],
+                [full_out[layer]],
+                host_indices,
+                full_device_indices,
+                layer,
+                main_page_size,
+            )
         torch.cuda.synchronize()
         expected = src[:, stored_device_indices[partial_host_indices]]
         torch.testing.assert_close(out[:, partial_device_indices], expected)
+        torch.testing.assert_close(
+            full_out[:, full_device_indices], src[:, stored_device_indices]
+        )
     else:
         src_k = torch.randn(num_layers, total_tokens, item_size, device=device)
         src_v = torch.randn_like(src_k)
@@ -783,6 +797,18 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
                 layer,
                 main_page_size,
             )
+        full_out_k = torch.zeros_like(src_k)
+        full_out_v = torch.zeros_like(src_v)
+        full_device_indices = torch.arange(4, 20, dtype=torch.int64)
+        for layer in range(num_layers):
+            transfer_kv_per_layer_chunked_pf_lf(
+                [host_k, host_v],
+                [full_out_k[layer], full_out_v[layer]],
+                host_indices,
+                full_device_indices,
+                layer,
+                main_page_size,
+            )
         torch.cuda.synchronize()
         expected_indices = stored_device_indices[partial_host_indices]
         torch.testing.assert_close(
@@ -790,6 +816,12 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
         )
         torch.testing.assert_close(
             out_v[:, partial_device_indices], src_v[:, expected_indices]
+        )
+        torch.testing.assert_close(
+            full_out_k[:, full_device_indices], src_k[:, stored_device_indices]
+        )
+        torch.testing.assert_close(
+            full_out_v[:, full_device_indices], src_v[:, stored_device_indices]
         )
 
 
