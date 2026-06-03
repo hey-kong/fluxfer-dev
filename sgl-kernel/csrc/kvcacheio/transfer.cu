@@ -756,7 +756,7 @@ void transfer_kv_all_layer_chunked_lf_pf(
     for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
       for (int64_t layer = 0; layer < num_layers; ++layer) {
         const auto& src = src_layers[kv * num_layers + layer];
-        char* stream_ptr = streaming[kv][page][layer].data_ptr<char>();
+        char* stream_ptr = reinterpret_cast<char*>(streaming[kv][page][layer].data_ptr());
         gather_kv_chunk_kernel<<<main_page_size, 256, 0, stream>>>(
             static_cast<const char*>(src.data_ptr()),
             stream_ptr,
@@ -766,7 +766,7 @@ void transfer_kv_all_layer_chunked_lf_pf(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       }
       const int64_t bytes = main_page_size * num_layers * item_size;
-      const char* src = streaming[kv][page].data_ptr<char>();
+      const char* src = reinterpret_cast<char*>(streaming[kv][page].data_ptr());
       char* dst = static_cast<char*>(dst_ptrs[kv].data_ptr()) + main_pages[page] * bytes;
       C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream));
     }
@@ -811,7 +811,7 @@ void transfer_kv_per_layer_chunked_pf_lf(
   const int64_t host_layer_stride = src_ptrs[0].stride(1) * src_ptrs[0].element_size();
   const int64_t host_page_stride = src_ptrs[0].stride(0) * src_ptrs[0].element_size();
   for (int64_t kv = 0; kv < num_kv; ++kv) {
-    char* stream_ptr = streaming[kv].data_ptr<char>();
+    char* stream_ptr = reinterpret_cast<char*>(streaming[kv].data_ptr());
     for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
       const char* src = static_cast<const char*>(src_ptrs[kv].data_ptr()) + main_pages[page] * host_page_stride +
                         layer_id * host_layer_stride;
