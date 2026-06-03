@@ -681,11 +681,15 @@ void transfer_kv_all_layer_mla_lf_pf(
       num_warps_per_block);
 }
 
+// Match the kernel HiCache IO backend's default GPU block quota.
+constexpr int64_t kChunkedBlockQuota = 2;
+
 __global__ void
 gather_kv_chunk_kernel(const char* src, char* dst, const int64_t* src_indices, int64_t num_tokens, int64_t item_size) {
-  const int64_t token = blockIdx.x;
-  for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
-    dst[token * item_size + byte] = src[src_indices[token] * item_size + byte];
+  for (int64_t token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+    for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
+      dst[token * item_size + byte] = src[src_indices[token] * item_size + byte];
+    }
   }
 }
 
@@ -696,9 +700,10 @@ __global__ void scatter_kv_chunk_kernel(
     const int64_t* dst_indices,
     int64_t num_tokens,
     int64_t item_size) {
-  const int64_t token = blockIdx.x;
-  for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
-    dst[dst_indices[token] * item_size + byte] = src[streaming_indices[token] * item_size + byte];
+  for (int64_t token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+    for (int64_t byte = threadIdx.x; byte < item_size; byte += blockDim.x) {
+      dst[dst_indices[token] * item_size + byte] = src[streaming_indices[token] * item_size + byte];
+    }
   }
 }
 
@@ -757,7 +762,8 @@ void transfer_kv_all_layer_chunked_lf_pf(
       for (int64_t layer = 0; layer < num_layers; ++layer) {
         const auto& src = src_layers[kv * num_layers + layer];
         char* stream_ptr = reinterpret_cast<char*>(streaming[kv][page][layer].data_ptr());
-        gather_kv_chunk_kernel<<<main_page_size, 256, 0, stream>>>(
+        const int64_t gather_blocks = main_page_size < kChunkedBlockQuota ? main_page_size : kChunkedBlockQuota;
+        gather_kv_chunk_kernel<<<gather_blocks, 256, 0, stream>>>(
             static_cast<const char*>(src.data_ptr()),
             stream_ptr,
             src_indices_device.data_ptr<int64_t>() + page * main_page_size,
@@ -822,7 +828,8 @@ void transfer_kv_per_layer_chunked_pf_lf(
           cudaMemcpyHostToDevice,
           stream));
     }
-    scatter_kv_chunk_kernel<<<num_tokens, 256, 0, stream>>>(
+    const int64_t scatter_blocks = num_tokens < kChunkedBlockQuota ? num_tokens : kChunkedBlockQuota;
+    scatter_kv_chunk_kernel<<<scatter_blocks, 256, 0, stream>>>(
         stream_ptr,
         static_cast<char*>(dst_layers[kv].data_ptr()),
         streaming_indices_device.data_ptr<int64_t>(),
