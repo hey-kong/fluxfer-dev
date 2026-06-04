@@ -735,6 +735,8 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
     # while scattering only the requested tokens into the destination pool.
     partial_host_indices = torch.tensor([9, 1, 14, 2, 9], dtype=torch.int64)
     partial_device_indices = torch.tensor([0, 3, 6, 17, 19], dtype=torch.int64)
+    complete_host_indices = torch.arange(0, 16, dtype=torch.int64)
+    complete_device_indices = torch.arange(0, 16, dtype=torch.int64)
 
     if is_mla:
         src = torch.randn(num_layers, total_tokens, item_size, device=device)
@@ -759,6 +761,22 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
         torch.cuda.synchronize()
         expected = src[:, stored_device_indices[partial_host_indices]]
         torch.testing.assert_close(out[:, partial_device_indices], expected)
+
+        complete_out = torch.zeros_like(src)
+        for layer in range(num_layers):
+            transfer_kv_per_layer_chunked_pf_lf(
+                [host],
+                [complete_out[layer]],
+                complete_host_indices,
+                complete_device_indices,
+                layer,
+                main_page_size,
+            )
+        torch.cuda.synchronize()
+        complete_expected = src[:, stored_device_indices[complete_host_indices]]
+        torch.testing.assert_close(
+            complete_out[:, complete_device_indices], complete_expected
+        )
     else:
         src_k = torch.randn(num_layers, total_tokens, item_size, device=device)
         src_v = torch.randn_like(src_k)
@@ -790,6 +808,28 @@ def test_transfer_kv_chunked_round_trip_partial_load(is_mla: bool):
         )
         torch.testing.assert_close(
             out_v[:, partial_device_indices], src_v[:, expected_indices]
+        )
+
+        complete_out_k = torch.zeros_like(src_k)
+        complete_out_v = torch.zeros_like(src_v)
+        for layer in range(num_layers):
+            transfer_kv_per_layer_chunked_pf_lf(
+                [host_k, host_v],
+                [complete_out_k[layer], complete_out_v[layer]],
+                complete_host_indices,
+                complete_device_indices,
+                layer,
+                main_page_size,
+            )
+        torch.cuda.synchronize()
+        complete_expected_indices = stored_device_indices[complete_host_indices]
+        torch.testing.assert_close(
+            complete_out_k[:, complete_device_indices],
+            src_k[:, complete_expected_indices],
+        )
+        torch.testing.assert_close(
+            complete_out_v[:, complete_device_indices],
+            src_v[:, complete_expected_indices],
         )
 
 

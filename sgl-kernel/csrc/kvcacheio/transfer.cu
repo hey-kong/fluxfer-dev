@@ -2,8 +2,8 @@
 #include <ATen/Functions.h>
 #include <ATen/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
@@ -702,6 +702,27 @@ __global__ void scatter_kv_chunk_kernel(
   }
 }
 
+static bool can_use_chunked_per_layer_direct_copy(
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    int64_t num_tokens,
+    int64_t main_page_size,
+    const std::vector<int64_t>& main_pages) {
+  if (num_tokens != static_cast<int64_t>(main_pages.size()) * main_page_size) {
+    return false;
+  }
+  for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+    const int64_t src_first = main_pages[page] * main_page_size;
+    const int64_t dst_first = dst_indices[page * main_page_size];
+    for (int64_t token = 0; token < main_page_size; ++token) {
+      const int64_t offset = page * main_page_size + token;
+      if (src_indices[offset] != src_first + token || dst_indices[offset] != dst_first + token) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 std::vector<int64_t> get_chunked_main_pages(const at::Tensor& host_indices, int64_t main_page_size) {
   auto host_indices_cpu = host_indices.cpu();
   const auto* indices = host_indices_cpu.data_ptr<int64_t>();
@@ -790,10 +811,35 @@ void transfer_kv_per_layer_chunked_pf_lf(
   auto main_pages = get_chunked_main_pages(src_indices, main_page_size);
   const int64_t expanded_tokens = main_pages.size() * main_page_size;
   const int64_t item_size = dst_layers[0].stride(0) * dst_layers[0].element_size();
-  auto options = at::TensorOptions().dtype(at::kByte).device(dst_layers[0].device());
-  auto streaming = at::empty({num_kv, expanded_tokens, item_size}, options);
   auto src_indices_cpu = src_indices.cpu();
+  auto dst_indices_cpu = dst_indices.cpu();
   const auto* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  const auto* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t host_layer_stride = src_ptrs[0].stride(1) * src_ptrs[0].element_size();
+  const int64_t host_page_stride = src_ptrs[0].stride(0) * src_ptrs[0].element_size();
+
+  // Fast path for the common scheduler case: the requested host tokens cover
+  // one or more complete, aligned main pages and each corresponding device
+  // destination range is contiguous.  In this case the host page for this
+  // layer already has the same token order as the destination layer, so avoid
+  // allocating a staging buffer and launching the scatter kernel.  This keeps
+  // the transfer layerwise (so compute can still consume layer N while layer
+  // N+1 is loading) but reduces per-layer overhead on the chunked backend.
+  const bool direct_copy =
+      can_use_chunked_per_layer_direct_copy(src_indices_ptr, dst_indices_ptr, num_tokens, main_page_size, main_pages);
+  if (direct_copy) {
+    for (int64_t kv = 0; kv < num_kv; ++kv) {
+      for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
+        const char* src = static_cast<const char*>(src_ptrs[kv].data_ptr()) + main_pages[page] * host_page_stride +
+                          layer_id * host_layer_stride;
+        char* dst = static_cast<char*>(dst_layers[kv].data_ptr()) + dst_indices_ptr[page * main_page_size] * item_size;
+        C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, main_page_size * item_size, cudaMemcpyHostToDevice, stream));
+      }
+    }
+    return;
+  }
+
   std::unordered_map<int64_t, int64_t> page_to_stream;
   for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
     page_to_stream[main_pages[page]] = page;
@@ -803,13 +849,12 @@ void transfer_kv_per_layer_chunked_pf_lf(
     const int64_t main_page = src_indices_ptr[token] / main_page_size;
     streaming_indices[token] = page_to_stream.at(main_page) * main_page_size + src_indices_ptr[token] % main_page_size;
   }
+  auto options = at::TensorOptions().dtype(at::kByte).device(dst_layers[0].device());
+  auto streaming = at::empty({num_kv, expanded_tokens, item_size}, options);
   auto streaming_indices_cpu = at::empty({num_tokens}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
   std::memcpy(streaming_indices_cpu.data_ptr<int64_t>(), streaming_indices.data(), num_tokens * sizeof(int64_t));
   auto streaming_indices_device = streaming_indices_cpu.to(dst_layers[0].device(), /*non_blocking=*/true);
   auto dst_indices_device = dst_indices.to(dst_layers[0].device(), /*non_blocking=*/true);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const int64_t host_layer_stride = src_ptrs[0].stride(1) * src_ptrs[0].element_size();
-  const int64_t host_page_stride = src_ptrs[0].stride(0) * src_ptrs[0].element_size();
   for (int64_t kv = 0; kv < num_kv; ++kv) {
     char* stream_ptr = reinterpret_cast<char*>(streaming[kv].data_ptr());
     for (int64_t page = 0; page < static_cast<int64_t>(main_pages.size()); ++page) {
