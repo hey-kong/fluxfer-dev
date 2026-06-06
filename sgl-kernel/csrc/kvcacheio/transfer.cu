@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/empty.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
