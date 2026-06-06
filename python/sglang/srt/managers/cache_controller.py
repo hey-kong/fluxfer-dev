@@ -77,9 +77,7 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
+        assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -98,7 +96,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -107,11 +104,13 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        h2d_preload_pages: int = 0,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.h2d_preload_pages = h2d_preload_pages
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -130,7 +129,13 @@ class CacheOperation:
         priority = min(op.priority for op in ops)
         for op in ops:
             node_ids.extend(op.node_ids)
-        merged_op = CacheOperation(host_indices, device_indices, -1, priority)
+        merged_op = CacheOperation(
+            host_indices,
+            device_indices,
+            -1,
+            priority,
+            h2d_preload_pages=sum(op.h2d_preload_pages for op in ops),
+        )
         merged_op.node_ids = node_ids
         return merged_op
 
@@ -245,7 +250,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -628,9 +632,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert (
-                tp_lcm_size % self.tp_size == 0
-            ), "tp_lcm_size must be divisible by tp_size."
+            assert tp_lcm_size % self.tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
             should_split_heads = (
                 not is_mla_backend
                 and self.mem_pool_host.layout == "page_head"
@@ -720,15 +724,18 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            write_io_backend = (
+                "block" if self.io_backend == "hybrid" else self.io_backend
+            )
             self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+                self.mem_pool_device, host_indices, device_indices, write_io_backend
             )
             if self.has_draft:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
                     device_indices,
-                    self.io_backend,
+                    write_io_backend,
                 )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
@@ -746,6 +753,7 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        h2d_preload_pages: int = 0,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
@@ -754,7 +762,13 @@ class HiCacheController:
         if device_indices is None:
             return None
         self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                h2d_preload_pages=h2d_preload_pages,
+            )
         )
         return device_indices
 
@@ -775,11 +789,13 @@ class HiCacheController:
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
-        elif self.io_backend == "block":
+        elif self.io_backend in ["block", "hybrid"]:
             if self.mem_pool_host.layout != "page_first_direct":
                 raise ValueError(
-                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'block'"
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend {self.io_backend!r}"
                 )
+            if self.io_backend == "hybrid":
+                return host_indices, device_indices.cpu()
             return host_indices.cpu(), device_indices
 
         elif self.io_backend == "kernel_ascend":
@@ -792,40 +808,98 @@ class HiCacheController:
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
-        self.load_queue.clear()
+        ops = self.load_queue
+        self.load_queue = []
+        op = CacheOperation.merge_ops(ops)
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
+        if self.io_backend == "hybrid":
+            moved_ops = []
+            for pending_op in ops:
+                host_indices, device_indices = self.move_indices(
+                    pending_op.host_indices, pending_op.device_indices
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
+                moved_ops.append((pending_op, host_indices, device_indices))
+
+            with device_module.stream(self.load_stream):
+                producer_event.start_event.wait(self.load_stream)
+
+                # First preload the request-prefix-nearest pages with DMA.
+                for pending_op, host_indices, device_indices in moved_ops:
+                    preload_tokens = min(
+                        pending_op.h2d_preload_pages * self.page_size,
+                        host_indices.numel(),
+                    )
+                    if preload_tokens > 0:
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            host_indices[:preload_tokens].cpu(),
+                            device_indices[:preload_tokens],
+                            0,
+                            "block",
+                        )
+
+                # Transfer the remaining pages like direct H2D, layer by layer,
+                # so the tail can overlap with prefill compute.
+                for i in range(self.layer_num):
+                    for pending_op, host_indices, device_indices in moved_ops:
+                        preload_tokens = min(
+                            pending_op.h2d_preload_pages * self.page_size,
+                            host_indices.numel(),
+                        )
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            host_indices[preload_tokens:],
+                            device_indices[preload_tokens:],
+                            i,
+                            "direct",
+                        )
+                        if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                            self.mem_pool_host_draft.load_to_device_per_layer(
+                                self.mem_pool_device_draft,
+                                host_indices,
+                                device_indices,
+                                i,
+                                "direct",
+                            )
+                    producer_event.complete(i)
+
+                for _, host_indices, device_indices in moved_ops:
+                    if host_indices.is_cuda:
+                        host_indices.record_stream(self.load_stream)
+                    if device_indices.is_cuda:
+                        device_indices.record_stream(self.load_stream)
+        else:
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
+            with device_module.stream(self.load_stream):
+                producer_event.start_event.wait(self.load_stream)
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
                         host_indices,
                         device_indices,
                         i,
                         self.io_backend,
                     )
-                producer_event.complete(i)
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+                    if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
+                    producer_event.complete(i)
+                # NOTE: We must save the host indices and device indices here,
+                # this is because we need to guarantee that these tensors are
+                # still alive when the load stream is executing.
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.load_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(

@@ -45,8 +45,15 @@ class CacheOperation(BaseCacheOperation):
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        h2d_preload_pages: int = 0,
     ):
-        super().__init__(host_indices, device_indices, node_id, priority)
+        super().__init__(
+            host_indices,
+            device_indices,
+            node_id,
+            priority,
+            h2d_preload_pages=h2d_preload_pages,
+        )
         self.pool_transfers = pool_transfers
 
     @staticmethod
@@ -92,6 +99,7 @@ class CacheOperation(BaseCacheOperation):
             -1,
             priority,
             pool_transfers=CacheOperation.merge_pool_transfers(ops),
+            h2d_preload_pages=sum(op.h2d_preload_pages for op in ops),
         )
         merged.node_ids = node_ids
         return merged
@@ -273,13 +281,34 @@ class HybridCacheController(BaseHiCacheController):
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
-            )
+            if self.io_backend == "hybrid":
+                # Hybrid D2H uses DMA for the anchor KV pool. Keep sidecar pools
+                # on direct IO because not all of them implement the block backend.
+                anchor = self.mem_pool_host.anchor_entry
+                anchor.host_pool.backup_from_device_all_layer(
+                    anchor.device_pool,
+                    host_indices,
+                    device_indices,
+                    "block",
+                )
+                for transfer in resolved_pool_transfers or []:
+                    entry = self.mem_pool_host.entry_map.get(transfer.name)
+                    if entry is None or transfer.host_indices is None:
+                        continue
+                    entry.host_pool.backup_from_device_all_layer(
+                        entry.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        "direct",
+                    )
+            else:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                    pool_transfers=resolved_pool_transfers,
+                )
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
@@ -295,6 +324,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        h2d_preload_pages: int = 0,
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
 
@@ -328,6 +358,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                h2d_preload_pages=h2d_preload_pages,
             )
         )
         return device_indices
@@ -336,31 +367,98 @@ class HybridCacheController(BaseHiCacheController):
         if not self.load_queue:
             return -1
         producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
-        self.load_queue.clear()
+        ops = self.load_queue
+        self.load_queue = []
+        op = CacheOperation.merge_ops(ops)
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
+
+        if self.io_backend == "hybrid":
+            moved_ops = []
+            for pending_op in ops:
+                host_indices, device_indices, resolved_pool_transfers = (
+                    self.move_hybrid_indices(pending_op)
+                )
+                moved_ops.append(
+                    (pending_op, host_indices, device_indices, resolved_pool_transfers)
+                )
+
+            with device_module.stream(self.load_stream):
+                producer_event.start_event.wait(self.load_stream)
+
+                # Preload the prefix-nearest KV pages with DMA. Extra pools keep
+                # the direct path because not all sidecar pools implement block IO.
+                for pending_op, host_indices, device_indices, _ in moved_ops:
+                    preload_tokens = min(
+                        pending_op.h2d_preload_pages * self.page_size,
+                        host_indices.numel(),
+                    )
+                    if preload_tokens > 0:
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            host_indices[:preload_tokens].cpu(),
+                            device_indices[:preload_tokens],
+                            0,
+                            "block",
+                        )
+
+                # Transfer the remaining KV pages like direct H2D, layer by layer,
+                # so the tail can overlap with prefill compute.
+                for i in range(self.layer_num):
+                    for (
+                        pending_op,
+                        host_indices,
+                        device_indices,
+                        resolved_pool_transfers,
+                    ) in moved_ops:
+                        preload_tokens = min(
+                            pending_op.h2d_preload_pages * self.page_size,
+                            host_indices.numel(),
+                        )
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            host_indices[preload_tokens:],
+                            device_indices[preload_tokens:],
+                            i,
+                            "direct",
+                            pool_transfers=resolved_pool_transfers,
+                        )
+                    producer_event.complete(i)
+
+                for (
+                    _,
                     host_indices,
                     device_indices,
-                    i,
-                    self.io_backend,
-                    pool_transfers=resolved_pool_transfers,
-                )
-                producer_event.complete(i)
-            self._record_transfer_indices_on_stream(
-                self.load_stream,
-                host_indices,
-                device_indices,
-                resolved_pool_transfers,
+                    resolved_pool_transfers,
+                ) in moved_ops:
+                    self._record_transfer_indices_on_stream(
+                        self.load_stream,
+                        host_indices,
+                        device_indices,
+                        resolved_pool_transfers,
+                    )
+        else:
+            host_indices, device_indices, resolved_pool_transfers = (
+                self.move_hybrid_indices(op)
             )
+            with device_module.stream(self.load_stream):
+                producer_event.start_event.wait(self.load_stream)
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                    )
+                    producer_event.complete(i)
+                self._record_transfer_indices_on_stream(
+                    self.load_stream,
+                    host_indices,
+                    device_indices,
+                    resolved_pool_transfers,
+                )
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,

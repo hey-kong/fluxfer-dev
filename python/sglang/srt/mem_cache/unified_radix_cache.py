@@ -555,12 +555,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1214,6 +1214,32 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_write_through[node.id] = (node, lock_params)
         return len(host_indices)
 
+    def _get_hybrid_h2d_preload_pages(self, host_tokens: int, req) -> int:
+        """Return how many host-hit pages hybrid H2D should DMA first.
+
+        Hybrid H2D keeps the remaining DRAM-hit tokens small enough relative
+        to tokens that still require prefill compute, then transfers that
+        computed prefix-nearest page prefix with DMA before direct per-layer
+        loading starts.
+        """
+        if getattr(self.cache_controller, "io_backend", None) != "hybrid":
+            return 0
+        if host_tokens <= 0 or req is None:
+            return 0
+
+        compute_tokens = max(req.extend_input_len - host_tokens, 0)
+        if compute_tokens == 0:
+            preload_tokens = host_tokens
+        else:
+            max_overlap_tokens = 4 * compute_tokens
+            if host_tokens <= max_overlap_tokens:
+                return 0
+            preload_tokens = host_tokens - max_overlap_tokens
+
+        preload_pages = (preload_tokens + self.page_size - 1) // self.page_size
+        total_pages = host_tokens // self.page_size
+        return min(preload_pages, total_pages)
+
     def load_back(
         self,
         best_match_node: UnifiedTreeNode,
@@ -1268,10 +1294,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        h2d_preload_pages = self._get_hybrid_h2d_preload_pages(kv_tokens, req)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
+            h2d_preload_pages=h2d_preload_pages,
         )
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
