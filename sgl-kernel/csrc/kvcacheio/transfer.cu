@@ -793,6 +793,16 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
+  // D2H page_first_direct previously used cudaMemcpyBatchAsync here, but this
+  // path has been observed to segfault inside cuMemcpyBatchAsync_v2 on CUDA 13
+  // runtimes/drivers in real HiCache write-back. Keep DMA semantics by falling
+  // back to the per-page non-blocking tensor copies for D2H; H2D can still use
+  // the batched path below when available.
+  if constexpr (IsLf2Pf) {
+    fallback_to_page_copy();
+    return;
+  }
+
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
   fallback_to_page_copy();
   return;
@@ -970,8 +980,6 @@ inline void transfer_kv_page_first_direct_impl(
 #endif
 }
 
-
-
 template <bool IsMLA>
 __global__ void scatter_kv_block_h2d_kernel(
     const void* __restrict__ src_k,
@@ -992,8 +1000,7 @@ __global__ void scatter_kv_block_h2d_kernel(
   const int64_t page_chunks = page_bytes / sizeof(uint64_t);
   for (int64_t page_id = 0; page_id < num_pages; ++page_id) {
     const int64_t dst_token_id = dst_indices[page_id * page_size];
-    const int64_t src_layer_offset =
-        (page_id * num_layers * page_size + layer_id * page_size) * item_size_bytes;
+    const int64_t src_layer_offset = (page_id * num_layers * page_size + layer_id * page_size) * item_size_bytes;
     const char* src_k_ptr = static_cast<const char*>(src_k) + src_layer_offset;
     char* dst_k_ptr = reinterpret_cast<char*>(dst_k_layer_tbl[layer_id]) + dst_token_id * item_size_bytes;
 
@@ -1032,8 +1039,9 @@ void scatter_kv_block_h2d(
   const bool is_mla = src_ptrs.size() == 1;
   const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
   TORCH_CHECK(num_layers > 0, "Number of destination layers must be positive");
-  TORCH_CHECK(is_mla || static_cast<int64_t>(dst_ptrs.size()) == num_layers * 2,
-              "MHA destination pointers must contain K layers followed by V layers");
+  TORCH_CHECK(
+      is_mla || static_cast<int64_t>(dst_ptrs.size()) == num_layers * 2,
+      "MHA destination pointers must contain K layers followed by V layers");
   const int64_t num_pages = dst_indices.numel() / page_size;
   if (num_pages == 0) {
     return;
