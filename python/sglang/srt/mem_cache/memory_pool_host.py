@@ -663,7 +663,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        elif io_backend == "direct":
+        elif io_backend in ["direct", "block"]:
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.k_buffer + device_pool.v_buffer,
@@ -1206,7 +1206,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        elif io_backend == "direct":
+        elif io_backend in ["direct", "block"]:
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.kv_buffer,
