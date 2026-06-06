@@ -3366,6 +3366,15 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic attach.",
             )
 
+        if self.server_args.hicache_io_backend == "hybrid":
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject attach: hybrid hicache_io_backend requires HiCache to "
+                    "use only HBM and DRAM."
+                ),
+            )
+
         try:
             ok, msg = self.tree_cache.attach_storage_backend(
                 storage_backend=recv_req.hicache_storage_backend,
