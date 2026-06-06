@@ -792,6 +792,16 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
+  // D2H page_first_direct previously used cudaMemcpyBatchAsync here, but this
+  // path has been observed to segfault inside cuMemcpyBatchAsync_v2 on CUDA 13
+  // runtimes/drivers in real HiCache write-back. Keep DMA semantics by falling
+  // back to the per-page non-blocking tensor copies for D2H; H2D can still use
+  // the batched path below when available.
+  if constexpr (IsLf2Pf) {
+    fallback_to_page_copy();
+    return;
+  }
+
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
   fallback_to_page_copy();
   return;
@@ -967,6 +977,121 @@ inline void transfer_kv_page_first_direct_impl(
     }
   }
 #endif
+}
+
+template <bool IsMLA>
+__global__ void scatter_kv_block_h2d_kernel(
+    const void* __restrict__ src_k,
+    const void* __restrict__ src_v,
+    const int64_t* __restrict__ dst_indices,
+    const uintptr_t* __restrict__ dst_k_layer_tbl,
+    const uintptr_t* __restrict__ dst_v_layer_tbl,
+    int64_t num_pages,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t item_size_bytes) {
+  const int64_t layer_id = threadIdx.x;
+  if (layer_id >= num_layers) {
+    return;
+  }
+
+  const int64_t page_bytes = page_size * item_size_bytes;
+  const int64_t page_chunks = page_bytes / sizeof(uint64_t);
+  for (int64_t page_id = 0; page_id < num_pages; ++page_id) {
+    const int64_t dst_token_id = dst_indices[page_id * page_size];
+    const int64_t src_layer_offset = (page_id * num_layers * page_size + layer_id * page_size) * item_size_bytes;
+    const char* src_k_ptr = static_cast<const char*>(src_k) + src_layer_offset;
+    char* dst_k_ptr = reinterpret_cast<char*>(dst_k_layer_tbl[layer_id]) + dst_token_id * item_size_bytes;
+
+    const uint64_t* __restrict__ src_k_u64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
+    uint64_t* __restrict__ dst_k_u64 = reinterpret_cast<uint64_t*>(dst_k_ptr);
+    for (int64_t offset = 0; offset < page_chunks; ++offset) {
+      dst_k_u64[offset] = src_k_u64[offset];
+    }
+
+    if constexpr (!IsMLA) {
+      const char* src_v_ptr = static_cast<const char*>(src_v) + src_layer_offset;
+      char* dst_v_ptr = reinterpret_cast<char*>(dst_v_layer_tbl[layer_id]) + dst_token_id * item_size_bytes;
+      const uint64_t* __restrict__ src_v_u64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
+      uint64_t* __restrict__ dst_v_u64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
+      for (int64_t offset = 0; offset < page_chunks; ++offset) {
+        dst_v_u64[offset] = src_v_u64[offset];
+      }
+    }
+  }
+}
+
+void scatter_kv_block_h2d(
+    const std::vector<at::Tensor>& src_ptrs,
+    const std::vector<at::Tensor>& dst_ptrs,
+    const at::Tensor& dst_indices,
+    int64_t page_size,
+    int64_t item_size) {
+  TORCH_CHECK(!src_ptrs.empty(), "Source pointers must not be empty");
+  TORCH_CHECK(!dst_ptrs.empty(), "Destination pointers must not be empty");
+  TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
+  TORCH_CHECK(page_size > 0, "Page size must be positive");
+  TORCH_CHECK(dst_indices.numel() % page_size == 0, "Destination indices size must be divisible by page size");
+  TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
+
+  const bool is_mla = src_ptrs.size() == 1;
+  const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+  TORCH_CHECK(num_layers > 0, "Number of destination layers must be positive");
+  TORCH_CHECK(
+      is_mla || static_cast<int64_t>(dst_ptrs.size()) == num_layers * 2,
+      "MHA destination pointers must contain K layers followed by V layers");
+  const int64_t num_pages = dst_indices.numel() / page_size;
+  if (num_pages == 0) {
+    return;
+  }
+
+  std::vector<uintptr_t> dst_k_ptrs_host(num_layers);
+  std::vector<uintptr_t> dst_v_ptrs_host(is_mla ? 0 : num_layers);
+  for (int64_t i = 0; i < num_layers; ++i) {
+    dst_k_ptrs_host[i] = reinterpret_cast<uintptr_t>(dst_ptrs[i].data_ptr());
+    if (!is_mla) {
+      dst_v_ptrs_host[i] = reinterpret_cast<uintptr_t>(dst_ptrs[i + num_layers].data_ptr());
+    }
+  }
+  auto options = at::TensorOptions().dtype(at::kLong).device(dst_indices.device());
+  at::Tensor dst_k_ptrs = at::empty({num_layers}, options);
+  at::Tensor dst_v_ptrs = is_mla ? at::Tensor() : at::empty({num_layers}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      dst_k_ptrs.data_ptr(), dst_k_ptrs_host.data(), num_layers * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
+  if (!is_mla) {
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        dst_v_ptrs.data_ptr(), dst_v_ptrs_host.data(), num_layers * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
+  }
+
+  TORCH_CHECK(num_layers <= 1024, "block H2D scatter requires at most 1024 layers");
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(num_layers, 1, 1);
+  if (is_mla) {
+    scatter_kv_block_h2d_kernel<true><<<grid_dim, block_dim, 0, stream>>>(
+        src_ptrs[0].data_ptr(),
+        nullptr,
+        dst_indices.data_ptr<int64_t>(),
+        reinterpret_cast<uintptr_t*>(dst_k_ptrs.data_ptr<int64_t>()),
+        nullptr,
+        num_pages,
+        num_layers,
+        page_size,
+        item_size);
+  } else {
+    scatter_kv_block_h2d_kernel<false><<<grid_dim, block_dim, 0, stream>>>(
+        src_ptrs[0].data_ptr(),
+        src_ptrs[1].data_ptr(),
+        dst_indices.data_ptr<int64_t>(),
+        reinterpret_cast<uintptr_t*>(dst_k_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<uintptr_t*>(dst_v_ptrs.data_ptr<int64_t>()),
+        num_pages,
+        num_layers,
+        page_size,
+        item_size);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void transfer_kv_per_layer_direct_pf_lf(

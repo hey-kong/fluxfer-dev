@@ -775,10 +775,17 @@ class HiCacheController:
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
+        elif self.io_backend == "block":
+            if self.mem_pool_host.layout != "page_first_direct":
+                raise ValueError(
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'block'"
+                )
+            return host_indices.cpu(), device_indices
+
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:
-            raise ValueError(f"Unsupported io backend")
+            raise ValueError("Unsupported io backend")
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
