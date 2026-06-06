@@ -848,13 +848,21 @@ class HiCacheController:
                             pending_op.h2d_preload_pages * self.page_size,
                             host_indices.numel(),
                         )
-                        self.mem_pool_host.load_to_device_per_layer(
-                            self.mem_pool_device,
-                            host_indices[preload_tokens:],
-                            device_indices[preload_tokens:],
-                            i,
-                            "direct",
-                        )
+                        tail_host_indices = host_indices[preload_tokens:]
+                        tail_device_indices = device_indices[preload_tokens:]
+                        # The tail is empty when the block-DMA preload already
+                        # copied the whole request. Example: host_indices has
+                        # 128 tokens, page_size is 32, and h2d_preload_pages is
+                        # 4, so preload_tokens == 128. In that case there is no
+                        # direct per-layer tail left to transfer.
+                        if tail_host_indices.numel() > 0:
+                            self.mem_pool_host.load_to_device_per_layer(
+                                self.mem_pool_device,
+                                tail_host_indices,
+                                tail_device_indices,
+                                i,
+                                "direct",
+                            )
                         if self.has_draft and i < self.mem_pool_host_draft.layer_num:
                             self.mem_pool_host_draft.load_to_device_per_layer(
                                 self.mem_pool_device_draft,

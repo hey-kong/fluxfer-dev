@@ -478,6 +478,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        # Hybrid H2D can fully satisfy a load with its block-DMA preload.
+        # Avoid calling the native transfer kernels with empty index tensors.
+        if host_indices.numel() == 0:
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1079,6 +1084,11 @@ class MLATokenToKVPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        # Hybrid H2D can fully satisfy a load with its block-DMA preload.
+        # Avoid calling the native transfer kernels with empty index tensors.
+        if host_indices.numel() == 0:
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -2605,6 +2615,11 @@ class NSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
+        # Hybrid H2D can fully satisfy a load with its block-DMA preload.
+        # Avoid calling the native transfer kernels with empty index tensors.
+        if host_page_indices.numel() == 0:
+            return
+
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
