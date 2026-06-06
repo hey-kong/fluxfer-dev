@@ -51,6 +51,7 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
+        scatter_kv_block_h2d,
         transfer_kv_direct,
         transfer_kv_per_layer,
         transfer_kv_per_layer_direct_pf_lf,
@@ -394,6 +395,56 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def _load_to_device_block_h2d(self, device_pool, host_indices, device_indices):
+        if self.layout != "page_first_direct":
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        num_pages = host_indices.numel() // self.page_size
+        if num_pages == 0:
+            return
+        # The staging buffer is sized for the current merged load operation and
+        # cached for reuse. All requested pages are copied into this buffer before
+        # the single scatter kernel runs; this is not a per-page copy/scatter loop.
+        # MHA allocates one K buffer and one V buffer, so total temporary GPU bytes
+        # are 2 * prod(shape) * dtype.itemsize.
+        shape = (
+            num_pages,
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.head_dim,
+        )
+        if (
+            not hasattr(self, "_block_k_buffer")
+            or self._block_k_buffer.shape != shape
+            or self._block_k_buffer.device != device_pool.device
+        ):
+            self._block_k_buffer = torch.empty(
+                shape, dtype=self.dtype, device=device_pool.device
+            )
+            self._block_v_buffer = torch.empty(
+                shape, dtype=self.dtype, device=device_pool.device
+            )
+
+        host_indices_cpu = host_indices.cpu()
+        for page_id in range(num_pages):
+            host_page_id = (
+                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
+            )
+            self._block_k_buffer[page_id].copy_(
+                self.k_buffer[host_page_id], non_blocking=True
+            )
+            self._block_v_buffer[page_id].copy_(
+                self.v_buffer[host_page_id], non_blocking=True
+            )
+
+        scatter_kv_block_h2d(
+            src_ptrs=[self._block_k_buffer, self._block_v_buffer],
+            dst_ptrs=device_pool.k_buffer + device_pool.v_buffer,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+            item_size=self.token_stride_size,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -492,6 +543,11 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "block":
+            if layer_id == 0:
+                self._load_to_device_block_h2d(
+                    device_pool, host_indices, device_indices
+                )
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
@@ -582,7 +638,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        elif io_backend == "direct":
+        elif io_backend in ["direct", "block"]:
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.k_buffer + device_pool.v_buffer,
@@ -922,6 +978,49 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
         return buffer
 
+    def _load_to_device_block_h2d(self, device_pool, host_indices, device_indices):
+        if self.layout != "page_first_direct":
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        num_pages = host_indices.numel() // self.page_size
+        if num_pages == 0:
+            return
+        # The staging buffer is sized for the current merged load operation and
+        # cached for reuse. All requested pages are copied into this buffer before
+        # the single scatter kernel runs; this is not a per-page copy/scatter loop.
+        # MLA has one KV buffer, so temporary GPU bytes are prod(shape) * dtype.itemsize.
+        shape = (
+            num_pages,
+            self.layer_num,
+            self.page_size,
+            1,
+            self.kv_cache_dim,
+        )
+        if (
+            not hasattr(self, "_block_kv_buffer")
+            or self._block_kv_buffer.shape != shape
+            or self._block_kv_buffer.device != device_pool.device
+        ):
+            self._block_kv_buffer = torch.empty(
+                shape, dtype=self.dtype, device=device_pool.device
+            )
+
+        host_indices_cpu = host_indices.cpu()
+        for page_id in range(num_pages):
+            host_page_id = (
+                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
+            )
+            self._block_kv_buffer[page_id].copy_(
+                self.kv_buffer[host_page_id], non_blocking=True
+            )
+
+        scatter_kv_block_h2d(
+            src_ptrs=[self._block_kv_buffer],
+            dst_ptrs=device_pool.kv_buffer,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+            item_size=self.token_stride_size,
+        )
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
@@ -964,6 +1063,11 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "block":
+            if layer_id == 0:
+                self._load_to_device_block_h2d(
+                    device_pool, host_indices, device_indices
+                )
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
@@ -1052,7 +1156,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        elif io_backend == "direct":
+        elif io_backend in ["direct", "block"]:
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.kv_buffer,

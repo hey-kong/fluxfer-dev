@@ -568,6 +568,13 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+void scatter_kv_block_h2d(
+    const std::vector<at::Tensor>& src_ptrs,
+    const std::vector<at::Tensor>& dst_ptrs,
+    const at::Tensor& dst_indices,
+    int64_t page_size,
+    int64_t item_size);
+
 void transfer_kv_per_layer_direct_pf_lf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,
