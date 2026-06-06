@@ -751,7 +751,7 @@ inline void transfer_kv_page_first_direct_impl(
   int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
   int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
-  auto fallback_to_page_copy = [&]() {
+  auto direct_page_copy = [&]() {
     if constexpr (IsLf2Pf) {
       const bool is_mla = dst_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
@@ -793,18 +793,20 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
-  // D2H page_first_direct previously used cudaMemcpyBatchAsync here, but this
-  // path has been observed to segfault inside cuMemcpyBatchAsync_v2 on CUDA 13
-  // runtimes/drivers in real HiCache write-back. Keep DMA semantics by falling
-  // back to the per-page non-blocking tensor copies for D2H; H2D can still use
-  // the batched path below when available.
+  // D2H page_first_direct is used by both the direct backend and the block
+  // backend write-back path. Do not route D2H through cudaMemcpyBatchAsync:
+  // CUDA 13 runtimes/drivers have been observed to segfault inside
+  // cuMemcpyBatchAsync_v2 before returning an error to PyTorch. The per-page
+  // tensor copies below still enqueue non-blocking DMA transfers on the current
+  // stream, matching the direct backend semantics without touching the unstable
+  // batched runtime entry point.
   if constexpr (IsLf2Pf) {
-    fallback_to_page_copy();
+    direct_page_copy();
     return;
   }
 
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
-  fallback_to_page_copy();
+  direct_page_copy();
   return;
 
 #else
@@ -812,14 +814,14 @@ inline void transfer_kv_page_first_direct_impl(
   int driver_version = 0;
   cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
   if (driver_version_err != cudaSuccess || driver_version < 12080) {
-    fallback_to_page_copy();
+    direct_page_copy();
     return;
   }
 
   // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
   static void* cuda_memcpy_batch_async_sym = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
   if (cuda_memcpy_batch_async_sym == nullptr) {
-    fallback_to_page_copy();
+    direct_page_copy();
     return;
   }
 
@@ -835,7 +837,7 @@ inline void transfer_kv_page_first_direct_impl(
   static int runtime_version = 0;
   static cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
   if (runtime_version_err != cudaSuccess) {
-    fallback_to_page_copy();
+    direct_page_copy();
     return;
   }
   static const bool use_v13_signature = runtime_version >= 13000;
@@ -970,7 +972,7 @@ inline void transfer_kv_page_first_direct_impl(
              stream);
     }
     if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
-      fallback_to_page_copy();
+      direct_page_copy();
       return;
     }
     if (err != cudaSuccess) {
@@ -998,6 +1000,7 @@ __global__ void scatter_kv_block_h2d_kernel(
 
   const int64_t page_bytes = page_size * item_size_bytes;
   const int64_t page_chunks = page_bytes / sizeof(uint64_t);
+  const int64_t page_tail_bytes = page_bytes % sizeof(uint64_t);
   for (int64_t page_id = 0; page_id < num_pages; ++page_id) {
     const int64_t dst_token_id = dst_indices[page_id * page_size];
     const int64_t src_layer_offset = (page_id * num_layers * page_size + layer_id * page_size) * item_size_bytes;
@@ -1009,6 +1012,10 @@ __global__ void scatter_kv_block_h2d_kernel(
     for (int64_t offset = 0; offset < page_chunks; ++offset) {
       dst_k_u64[offset] = src_k_u64[offset];
     }
+    for (int64_t offset = 0; offset < page_tail_bytes; ++offset) {
+      const int64_t byte_offset = page_chunks * sizeof(uint64_t) + offset;
+      dst_k_ptr[byte_offset] = src_k_ptr[byte_offset];
+    }
 
     if constexpr (!IsMLA) {
       const char* src_v_ptr = static_cast<const char*>(src_v) + src_layer_offset;
@@ -1017,6 +1024,10 @@ __global__ void scatter_kv_block_h2d_kernel(
       uint64_t* __restrict__ dst_v_u64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
       for (int64_t offset = 0; offset < page_chunks; ++offset) {
         dst_v_u64[offset] = src_v_u64[offset];
+      }
+      for (int64_t offset = 0; offset < page_tail_bytes; ++offset) {
+        const int64_t byte_offset = page_chunks * sizeof(uint64_t) + offset;
+        dst_v_ptr[byte_offset] = src_v_ptr[byte_offset];
       }
     }
   }
