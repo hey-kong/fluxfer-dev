@@ -683,16 +683,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "block":
-            if self.layout != "page_first_direct":
-                raise ValueError(f"Unsupported layout: {self.layout}")
-            # block uses the direct DMA write-back path for D2H; only H2D is
-            # staged through the GPU streaming buffer plus scatter kernel.
-            transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
-                dst_ptrs=[self.k_buffer, self.v_buffer],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
+            # Keep the block backend write-back path on ordinary per-page
+            # cudaMemcpyAsync DMA transfers.  In particular, do not call
+            # transfer_kv_all_layer_direct_lf_pf here: that direct helper may
+            # use cudaMemcpyBatchAsync on some builds, and cuMemcpyBatchAsync_v2
+            # can segfault in the CUDA runtime before returning an error.
+            self._backup_from_device_block_d2h(
+                device_pool, host_indices, device_indices
             )
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
@@ -1234,16 +1231,13 @@ class MLATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "block":
-            if self.layout != "page_first_direct":
-                raise ValueError(f"Unsupported layout: {self.layout}")
-            # block uses the direct DMA write-back path for D2H; only H2D is
-            # staged through the GPU streaming buffer plus scatter kernel.
-            transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=device_pool.kv_buffer,
-                dst_ptrs=[self.kv_buffer],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
+            # Keep the block backend write-back path on ordinary per-page
+            # cudaMemcpyAsync DMA transfers.  In particular, do not call
+            # transfer_kv_all_layer_direct_lf_pf here: that direct helper may
+            # use cudaMemcpyBatchAsync on some builds, and cuMemcpyBatchAsync_v2
+            # can segfault in the CUDA runtime before returning an error.
+            self._backup_from_device_block_d2h(
+                device_pool, host_indices, device_indices
             )
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
