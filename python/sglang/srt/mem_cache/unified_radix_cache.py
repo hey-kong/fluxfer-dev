@@ -1231,7 +1231,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if compute_tokens == 0:
             preload_tokens = host_tokens
         else:
-            max_overlap_tokens = 4 * compute_tokens
+            max_overlap_tokens = 8 * compute_tokens
             if host_tokens <= max_overlap_tokens:
                 return 0
             preload_tokens = host_tokens - max_overlap_tokens
