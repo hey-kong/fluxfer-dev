@@ -803,6 +803,22 @@ class HiCacheController:
         else:
             raise ValueError("Unsupported io backend")
 
+    def _get_hybrid_preload_tokens(
+        self, host_indices: torch.Tensor, h2d_preload_pages: int
+    ) -> int:
+        """Return the page-aligned token prefix that hybrid H2D may preload.
+
+        The block H2D path operates on whole pages.  Clamp the requested
+        preload to the number of complete pages present in ``host_indices`` so
+        a malformed or future caller cannot skip a partial tail that block H2D
+        did not copy.
+        """
+        if h2d_preload_pages <= 0 or host_indices.numel() == 0:
+            return 0
+        full_pages = host_indices.numel() // self.page_size
+        preload_pages = min(h2d_preload_pages, full_pages)
+        return preload_pages * self.page_size
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -831,9 +847,8 @@ class HiCacheController:
                 preload_host_indices = []
                 preload_device_indices = []
                 for pending_op, host_indices, device_indices in moved_ops:
-                    preload_tokens = min(
-                        pending_op.h2d_preload_pages * self.page_size,
-                        host_indices.numel(),
+                    preload_tokens = self._get_hybrid_preload_tokens(
+                        host_indices, pending_op.h2d_preload_pages
                     )
                     if preload_tokens > 0:
                         preload_host_indices.append(host_indices[:preload_tokens].cpu())
@@ -851,9 +866,8 @@ class HiCacheController:
                 # so the tail can overlap with prefill compute.
                 for i in range(self.layer_num):
                     for pending_op, host_indices, device_indices in moved_ops:
-                        preload_tokens = min(
-                            pending_op.h2d_preload_pages * self.page_size,
-                            host_indices.numel(),
+                        preload_tokens = self._get_hybrid_preload_tokens(
+                            host_indices, pending_op.h2d_preload_pages
                         )
                         tail_host_indices = host_indices[preload_tokens:]
                         tail_device_indices = device_indices[preload_tokens:]

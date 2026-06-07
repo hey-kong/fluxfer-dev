@@ -589,9 +589,20 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "block":
-            if layer_id == 0:
+            full_page_tokens = (host_indices.numel() // self.page_size) * self.page_size
+            if full_page_tokens > 0 and layer_id == 0:
                 self._load_to_device_block_h2d(
-                    device_pool, host_indices, device_indices
+                    device_pool,
+                    host_indices[:full_page_tokens],
+                    device_indices[:full_page_tokens],
+                )
+            if full_page_tokens < host_indices.numel():
+                self.load_to_device_per_layer(
+                    device_pool,
+                    host_indices[full_page_tokens:],
+                    device_indices[full_page_tokens:],
+                    layer_id,
+                    "direct",
                 )
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
@@ -1125,9 +1136,20 @@ class MLATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "block":
-            if layer_id == 0:
+            full_page_tokens = (host_indices.numel() // self.page_size) * self.page_size
+            if full_page_tokens > 0 and layer_id == 0:
                 self._load_to_device_block_h2d(
-                    device_pool, host_indices, device_indices
+                    device_pool,
+                    host_indices[:full_page_tokens],
+                    device_indices[:full_page_tokens],
+                )
+            if full_page_tokens < host_indices.numel():
+                self.load_to_device_per_layer(
+                    device_pool,
+                    host_indices[full_page_tokens:],
+                    device_indices[full_page_tokens:],
+                    layer_id,
+                    "direct",
                 )
         elif io_backend == "direct":
             if self.layout == "layer_first":

@@ -363,6 +363,20 @@ class HybridCacheController(BaseHiCacheController):
         )
         return device_indices
 
+    def _get_hybrid_preload_tokens(
+        self, host_indices: torch.Tensor, h2d_preload_pages: int
+    ) -> int:
+        """Return the page-aligned token prefix that hybrid H2D may preload.
+
+        Block H2D copies complete pages only.  Keep the hybrid direct-tail
+        offset page-aligned so partial pages are still handled by direct H2D.
+        """
+        if h2d_preload_pages <= 0 or host_indices.numel() == 0:
+            return 0
+        full_pages = host_indices.numel() // self.page_size
+        preload_pages = min(h2d_preload_pages, full_pages)
+        return preload_pages * self.page_size
+
     def start_loading(self) -> int:
         if not self.load_queue:
             return -1
@@ -393,9 +407,8 @@ class HybridCacheController(BaseHiCacheController):
                 preload_host_indices = []
                 preload_device_indices = []
                 for pending_op, host_indices, device_indices, _ in moved_ops:
-                    preload_tokens = min(
-                        pending_op.h2d_preload_pages * self.page_size,
-                        host_indices.numel(),
+                    preload_tokens = self._get_hybrid_preload_tokens(
+                        host_indices, pending_op.h2d_preload_pages
                     )
                     if preload_tokens > 0:
                         preload_host_indices.append(host_indices[:preload_tokens].cpu())
@@ -418,9 +431,8 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices,
                         resolved_pool_transfers,
                     ) in moved_ops:
-                        preload_tokens = min(
-                            pending_op.h2d_preload_pages * self.page_size,
-                            host_indices.numel(),
+                        preload_tokens = self._get_hybrid_preload_tokens(
+                            host_indices, pending_op.h2d_preload_pages
                         )
                         self.mem_pool_host.load_to_device_per_layer(
                             self.mem_pool_device,
