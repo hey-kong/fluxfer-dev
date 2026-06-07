@@ -101,6 +101,42 @@ def write_req_to_token_pool_triton(
         )
 
 
+def should_use_triton_write_cache_indices(
+    prefix_tensors: list[torch.Tensor],
+    req_to_token_pool: ReqToTokenPool,
+) -> bool:
+    server_args = get_global_server_args()
+
+    if not support_triton(server_args.attention_backend):
+        return False
+
+    # The Triton fast path below passes raw tensor data pointers to a custom
+    # kernel. HiCache can replace, split, and load back prefix tensors while
+    # the scheduler is running, and the kernel I/O backend adds additional
+    # asynchronous CUDA work. Keep HiCache on the PyTorch indexing path so the
+    # dispatcher tracks tensor lifetimes and stream dependencies instead of
+    # dereferencing opaque pointers. This avoids intermittent illegal-address
+    # failures in long-running HiCache servers.
+    if getattr(server_args, "enable_hierarchical_cache", False):
+        return False
+
+    # Empty CPU prefix tensors are common defaults and are harmless because the
+    # kernel will not dereference them. Any non-empty prefix must be on the same
+    # device as req_to_token_pool; otherwise the raw pointer is not valid for the
+    # device kernel.
+    pool_device = torch.device(req_to_token_pool.device)
+    for tensor in prefix_tensors:
+        if tensor.numel() == 0:
+            continue
+        tensor_device = torch.device(tensor.device)
+        if tensor_device.type != pool_device.type:
+            return False
+        if pool_device.index is not None and tensor_device.index != pool_device.index:
+            return False
+
+    return True
+
+
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -114,7 +150,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if should_use_triton_write_cache_indices(prefix_tensors, req_to_token_pool):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
