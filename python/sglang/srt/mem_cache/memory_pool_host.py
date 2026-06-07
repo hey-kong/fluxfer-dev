@@ -68,6 +68,14 @@ logger = logging.getLogger(__name__)
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+# Preallocate block-H2D staging buffers for a moderate number of pages so the
+# first hybrid page preload does not pay GPU allocation cost on the TTFT path.
+DEFAULT_BLOCK_H2D_STAGING_PAGES: int = 256
+
+# Use two chunks inside the fixed staging buffer for large block-H2D preloads so
+# staging copy for the next chunk can overlap with scatter for the previous one.
+BLOCK_H2D_PIPELINE_STAGES: int = 2
+
 
 def synchronized(func):
     @wraps(func)
@@ -211,6 +219,20 @@ class HostKVCache(abc.ABC):
         self.lock = threading.RLock()
         self.clear()
 
+    def _get_block_h2d_pipeline_streams(self, device):
+        device = torch.device(device)
+        stream_device = getattr(self, "_block_h2d_stream_device", None)
+        if not hasattr(self, "_block_h2d_copy_stream") or stream_device != device:
+            self._block_h2d_stream_device = device
+            self._block_h2d_copy_stream = torch.cuda.Stream(device=device)
+            self._block_h2d_scatter_stream = torch.cuda.Stream(device=device)
+        return self._block_h2d_copy_stream, self._block_h2d_scatter_stream
+
+    @staticmethod
+    def _record_if_cuda(tensor: Optional[torch.Tensor], stream) -> None:
+        if tensor is not None and tensor.is_cuda:
+            tensor.record_stream(stream)
+
     @abc.abstractmethod
     def get_size_per_token(self):
         raise NotImplementedError()
@@ -338,6 +360,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        if self.layout == "page_first_direct" and _is_cuda:
+            self._ensure_block_h2d_staging_buffers(
+                DEFAULT_BLOCK_H2D_STAGING_PAGES, self.device_pool.device
+            )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -461,22 +487,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             non_blocking=True,
         )
 
-    def _load_to_device_block_h2d(self, device_pool, host_indices, device_indices):
-        if self.layout != "page_first_direct":
-            raise ValueError(f"Unsupported layout: {self.layout}")
-        num_pages = host_indices.numel() // self.page_size
-        if num_pages == 0:
-            return
-        # Staging buffers are reused by capacity, then sliced to the current
-        # number of pages. All requested pages are staged before the single
-        # scatter kernel runs; this is not a per-page scatter loop.
-        block_k_buffer, block_v_buffer = self._ensure_block_h2d_staging_buffers(
-            num_pages, device_pool.device
-        )
-
-        host_indices_cpu = host_indices.cpu()
-        self._stage_block_h2d_pages(block_k_buffer, block_v_buffer, host_indices_cpu)
-
+    def _scatter_block_h2d_chunk(
+        self, device_pool, block_k_buffer, block_v_buffer, device_indices
+    ):
         scatter_kv_block_h2d(
             src_ptrs=[block_k_buffer, block_v_buffer],
             dst_ptrs=device_pool.k_buffer + device_pool.v_buffer,
@@ -484,6 +497,89 @@ class MHATokenToKVPoolHost(HostKVCache):
             page_size=self.page_size,
             item_size=self.token_stride_size,
         )
+
+    def _load_to_device_block_h2d(self, device_pool, host_indices, device_indices):
+        if self.layout != "page_first_direct":
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        num_pages = host_indices.numel() // self.page_size
+        if num_pages == 0:
+            return
+
+        staging_pages = min(num_pages, DEFAULT_BLOCK_H2D_STAGING_PAGES)
+        block_k_buffer, block_v_buffer = self._ensure_block_h2d_staging_buffers(
+            staging_pages, device_pool.device
+        )
+
+        host_indices_cpu = host_indices.cpu()
+        if not device_indices.is_cuda:
+            device_indices = device_indices.to(device_pool.device, non_blocking=True)
+
+        if num_pages <= staging_pages or staging_pages < BLOCK_H2D_PIPELINE_STAGES:
+            block_k_buffer = block_k_buffer[:num_pages]
+            block_v_buffer = block_v_buffer[:num_pages]
+            self._stage_block_h2d_pages(
+                block_k_buffer, block_v_buffer, host_indices_cpu
+            )
+            self._scatter_block_h2d_chunk(
+                device_pool, block_k_buffer, block_v_buffer, device_indices
+            )
+            self._record_if_cuda(
+                device_indices,
+                torch.cuda.current_stream(torch.device(device_pool.device)),
+            )
+            return
+
+        copy_stream, scatter_stream = self._get_block_h2d_pipeline_streams(
+            device_pool.device
+        )
+        current_stream = torch.cuda.current_stream(torch.device(device_pool.device))
+        copy_stream.wait_stream(current_stream)
+        scatter_stream.wait_stream(current_stream)
+
+        chunk_pages = max(1, staging_pages // BLOCK_H2D_PIPELINE_STAGES)
+        copy_done_events = [
+            torch.cuda.Event() for _ in range(BLOCK_H2D_PIPELINE_STAGES)
+        ]
+        scatter_done_events = [None] * BLOCK_H2D_PIPELINE_STAGES
+        used_slots = set()
+
+        for chunk_id, page_start in enumerate(range(0, num_pages, chunk_pages)):
+            page_end = min(page_start + chunk_pages, num_pages)
+            actual_pages = page_end - page_start
+            token_start = page_start * self.page_size
+            token_end = page_end * self.page_size
+            slot = chunk_id % BLOCK_H2D_PIPELINE_STAGES
+            slot_start = slot * chunk_pages
+            slot_end = slot_start + actual_pages
+            used_slots.add(slot)
+
+            with torch.cuda.stream(copy_stream):
+                if scatter_done_events[slot] is not None:
+                    copy_stream.wait_event(scatter_done_events[slot])
+                chunk_k_buffer = block_k_buffer[slot_start:slot_end]
+                chunk_v_buffer = block_v_buffer[slot_start:slot_end]
+                self._stage_block_h2d_pages(
+                    chunk_k_buffer,
+                    chunk_v_buffer,
+                    host_indices_cpu[token_start:token_end],
+                )
+                copy_done_events[slot].record(copy_stream)
+
+            with torch.cuda.stream(scatter_stream):
+                scatter_stream.wait_event(copy_done_events[slot])
+                self._scatter_block_h2d_chunk(
+                    device_pool,
+                    block_k_buffer[slot_start:slot_end],
+                    block_v_buffer[slot_start:slot_end],
+                    device_indices[token_start:token_end],
+                )
+                scatter_done_events[slot] = torch.cuda.Event()
+                scatter_done_events[slot].record(scatter_stream)
+
+        for slot in used_slots:
+            current_stream.wait_event(scatter_done_events[slot])
+
+        self._record_if_cuda(device_indices, scatter_stream)
 
     def load_to_device_per_layer(
         self,
@@ -950,6 +1046,10 @@ class MLATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        if self.layout == "page_first_direct" and _is_cuda:
+            self._ensure_block_h2d_staging_buffer(
+                DEFAULT_BLOCK_H2D_STAGING_PAGES, self.device_pool.device
+            )
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -1045,48 +1145,123 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
         return buffer
 
+    def _ensure_block_h2d_staging_buffer(self, num_pages: int, device):
+        # Keep capacity-based staging buffers instead of reallocating whenever a
+        # request has a different number of pages. The block copy only uses the
+        # leading ``num_pages`` slice, while the cached allocation can be reused by
+        # later smaller block transfers. MLA has one KV buffer, so temporary GPU
+        # bytes are prod(shape) * dtype.itemsize.
+        capacity = getattr(self, "_block_buffer_capacity_pages", 0)
+        has_buffer = hasattr(self, "_block_kv_buffer")
+        device_changed = has_buffer and self._block_kv_buffer.device != device
+        needs_alloc = capacity < num_pages or not has_buffer or device_changed
+        if needs_alloc:
+            reusable_capacity = 0 if device_changed else capacity
+            new_capacity = max(num_pages, reusable_capacity * 2, 1)
+            shape = (
+                new_capacity,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_cache_dim,
+            )
+            self._block_kv_buffer = torch.empty(shape, dtype=self.dtype, device=device)
+            self._block_buffer_capacity_pages = new_capacity
+
+        return self._block_kv_buffer[:num_pages]
+
+    def _stage_block_h2d_pages(self, block_kv_buffer, host_indices_cpu):
+        num_pages = block_kv_buffer.shape[0]
+        for page_id in range(num_pages):
+            host_page_id = (
+                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
+            )
+            block_kv_buffer[page_id].copy_(
+                self.kv_buffer[host_page_id], non_blocking=True
+            )
+
+    def _scatter_block_h2d_chunk(self, device_pool, block_kv_buffer, device_indices):
+        scatter_kv_block_h2d(
+            src_ptrs=[block_kv_buffer],
+            dst_ptrs=device_pool.kv_buffer,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+            item_size=self.token_stride_size,
+        )
+
     def _load_to_device_block_h2d(self, device_pool, host_indices, device_indices):
         if self.layout != "page_first_direct":
             raise ValueError(f"Unsupported layout: {self.layout}")
         num_pages = host_indices.numel() // self.page_size
         if num_pages == 0:
             return
-        # The staging buffer is sized for the current merged load operation and
-        # cached for reuse. All requested pages are copied into this buffer before
-        # the single scatter kernel runs; this is not a per-page copy/scatter loop.
-        # MLA has one KV buffer, so temporary GPU bytes are prod(shape) * dtype.itemsize.
-        shape = (
-            num_pages,
-            self.layer_num,
-            self.page_size,
-            1,
-            self.kv_cache_dim,
+
+        staging_pages = min(num_pages, DEFAULT_BLOCK_H2D_STAGING_PAGES)
+        block_kv_buffer = self._ensure_block_h2d_staging_buffer(
+            staging_pages, device_pool.device
         )
-        if (
-            not hasattr(self, "_block_kv_buffer")
-            or self._block_kv_buffer.shape != shape
-            or self._block_kv_buffer.device != device_pool.device
-        ):
-            self._block_kv_buffer = torch.empty(
-                shape, dtype=self.dtype, device=device_pool.device
-            )
 
         host_indices_cpu = host_indices.cpu()
-        for page_id in range(num_pages):
-            host_page_id = (
-                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
-            )
-            self._block_kv_buffer[page_id].copy_(
-                self.kv_buffer[host_page_id], non_blocking=True
-            )
+        if not device_indices.is_cuda:
+            device_indices = device_indices.to(device_pool.device, non_blocking=True)
 
-        scatter_kv_block_h2d(
-            src_ptrs=[self._block_kv_buffer],
-            dst_ptrs=device_pool.kv_buffer,
-            dst_indices=device_indices,
-            page_size=self.page_size,
-            item_size=self.token_stride_size,
+        if num_pages <= staging_pages or staging_pages < BLOCK_H2D_PIPELINE_STAGES:
+            block_kv_buffer = block_kv_buffer[:num_pages]
+            self._stage_block_h2d_pages(block_kv_buffer, host_indices_cpu)
+            self._scatter_block_h2d_chunk(device_pool, block_kv_buffer, device_indices)
+            self._record_if_cuda(
+                device_indices,
+                torch.cuda.current_stream(torch.device(device_pool.device)),
+            )
+            return
+
+        copy_stream, scatter_stream = self._get_block_h2d_pipeline_streams(
+            device_pool.device
         )
+        current_stream = torch.cuda.current_stream(torch.device(device_pool.device))
+        copy_stream.wait_stream(current_stream)
+        scatter_stream.wait_stream(current_stream)
+
+        chunk_pages = max(1, staging_pages // BLOCK_H2D_PIPELINE_STAGES)
+        copy_done_events = [
+            torch.cuda.Event() for _ in range(BLOCK_H2D_PIPELINE_STAGES)
+        ]
+        scatter_done_events = [None] * BLOCK_H2D_PIPELINE_STAGES
+        used_slots = set()
+
+        for chunk_id, page_start in enumerate(range(0, num_pages, chunk_pages)):
+            page_end = min(page_start + chunk_pages, num_pages)
+            actual_pages = page_end - page_start
+            token_start = page_start * self.page_size
+            token_end = page_end * self.page_size
+            slot = chunk_id % BLOCK_H2D_PIPELINE_STAGES
+            slot_start = slot * chunk_pages
+            slot_end = slot_start + actual_pages
+            used_slots.add(slot)
+
+            with torch.cuda.stream(copy_stream):
+                if scatter_done_events[slot] is not None:
+                    copy_stream.wait_event(scatter_done_events[slot])
+                chunk_kv_buffer = block_kv_buffer[slot_start:slot_end]
+                self._stage_block_h2d_pages(
+                    chunk_kv_buffer, host_indices_cpu[token_start:token_end]
+                )
+                copy_done_events[slot].record(copy_stream)
+
+            with torch.cuda.stream(scatter_stream):
+                scatter_stream.wait_event(copy_done_events[slot])
+                self._scatter_block_h2d_chunk(
+                    device_pool,
+                    block_kv_buffer[slot_start:slot_end],
+                    device_indices[token_start:token_end],
+                )
+                scatter_done_events[slot] = torch.cuda.Event()
+                scatter_done_events[slot].record(scatter_stream)
+
+        for slot in used_slots:
+            current_stream.wait_event(scatter_done_events[slot])
+
+        self._record_if_cuda(device_indices, scatter_stream)
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend

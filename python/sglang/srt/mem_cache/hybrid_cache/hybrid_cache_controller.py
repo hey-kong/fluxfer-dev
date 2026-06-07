@@ -389,13 +389,49 @@ class HybridCacheController(BaseHiCacheController):
 
         if self.io_backend == "hybrid":
             moved_ops = []
+            tail_host_indices = []
+            tail_device_indices = []
+            tail_pool_ops = []
             for pending_op in ops:
                 host_indices, device_indices, resolved_pool_transfers = (
                     self.move_hybrid_indices(pending_op)
                 )
-                moved_ops.append(
-                    (pending_op, host_indices, device_indices, resolved_pool_transfers)
+                preload_tokens = self._get_hybrid_preload_tokens(
+                    host_indices, pending_op.h2d_preload_pages
                 )
+                moved_ops.append(
+                    (
+                        pending_op,
+                        host_indices,
+                        device_indices,
+                        resolved_pool_transfers,
+                        preload_tokens,
+                    )
+                )
+                if preload_tokens < host_indices.numel():
+                    tail_host_indices.append(host_indices[preload_tokens:])
+                    tail_device_indices.append(device_indices[preload_tokens:])
+                if resolved_pool_transfers:
+                    tail_pool_ops.append(
+                        CacheOperation(
+                            host_indices.new_empty((0,)),
+                            device_indices.new_empty((0,)),
+                            -1,
+                            pool_transfers=resolved_pool_transfers,
+                        )
+                    )
+
+            merged_tail_pool_transfers = CacheOperation.merge_pool_transfers(
+                tail_pool_ops
+            )
+            if tail_host_indices:
+                merged_tail_host_indices = torch.cat(tail_host_indices)
+                merged_tail_device_indices = torch.cat(tail_device_indices)
+            else:
+                first_host_indices = moved_ops[0][1]
+                first_device_indices = moved_ops[0][2]
+                merged_tail_host_indices = first_host_indices.new_empty((0,))
+                merged_tail_device_indices = first_device_indices.new_empty((0,))
 
             with device_module.stream(self.load_stream):
                 producer_event.start_event.wait(self.load_stream)
@@ -406,10 +442,7 @@ class HybridCacheController(BaseHiCacheController):
                 # to reduce small H2D copies and scatter launches.
                 preload_host_indices = []
                 preload_device_indices = []
-                for pending_op, host_indices, device_indices, _ in moved_ops:
-                    preload_tokens = self._get_hybrid_preload_tokens(
-                        host_indices, pending_op.h2d_preload_pages
-                    )
+                for _, host_indices, device_indices, _, preload_tokens in moved_ops:
                     if preload_tokens > 0:
                         preload_host_indices.append(host_indices[:preload_tokens].cpu())
                         preload_device_indices.append(device_indices[:preload_tokens])
@@ -423,32 +456,33 @@ class HybridCacheController(BaseHiCacheController):
                     )
 
                 # Transfer the remaining KV pages like direct H2D, layer by layer,
-                # so the tail can overlap with prefill compute.
-                for i in range(self.layer_num):
-                    for (
-                        pending_op,
-                        host_indices,
-                        device_indices,
-                        resolved_pool_transfers,
-                    ) in moved_ops:
-                        preload_tokens = self._get_hybrid_preload_tokens(
-                            host_indices, pending_op.h2d_preload_pages
-                        )
+                # so the tail can overlap with prefill compute.  Keep the tail
+                # merged across pending ops to match direct loading's launch
+                # granularity instead of issuing one small copy per op per layer.
+                if (
+                    merged_tail_host_indices.numel() > 0
+                    or merged_tail_pool_transfers is not None
+                ):
+                    for i in range(self.layer_num):
                         self.mem_pool_host.load_to_device_per_layer(
                             self.mem_pool_device,
-                            host_indices[preload_tokens:],
-                            device_indices[preload_tokens:],
+                            merged_tail_host_indices,
+                            merged_tail_device_indices,
                             i,
                             "direct",
-                            pool_transfers=resolved_pool_transfers,
+                            pool_transfers=merged_tail_pool_transfers,
                         )
-                    producer_event.complete(i)
+                        producer_event.complete(i)
+                else:
+                    for i in range(self.layer_num):
+                        producer_event.complete(i)
 
                 for (
                     _,
                     host_indices,
                     device_indices,
                     resolved_pool_transfers,
+                    _,
                 ) in moved_ops:
                     self._record_transfer_indices_on_stream(
                         self.load_stream,
