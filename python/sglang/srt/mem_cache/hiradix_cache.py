@@ -167,6 +167,10 @@ class HiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        # Nodes that should be evicted from HBM after their write-through
+        # host backup finishes. This is used by the hybrid IO + write-through
+        # policy to keep newly generated pages only in DRAM.
+        self.pending_device_evict_after_backup = set()
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
@@ -659,6 +663,111 @@ class HiRadixCache(RadixCache):
             return {"host_pools": self.cache_controller.mem_pool_host.entries}
         return {}
 
+    def _hybrid_write_through_evict_policy(self) -> bool:
+        return (
+            isinstance(self.cache_controller, HybridCacheController)
+            and self.cache_controller.io_backend == "hybrid"
+            and self.cache_controller.write_policy == "write_through"
+        )
+
+    def _node_prefix_key(self, node: TreeNode) -> RadixKey:
+        parts = []
+        extra_key = None
+        cur = node
+        while cur is not self.root_node:
+            parts.append(cur.key)
+            if extra_key is None:
+                extra_key = cur.key.extra_key
+            cur = cur.parent
+        parts.reverse()
+
+        token_ids = []
+        for part in parts:
+            if self.is_eagle and token_ids and part.token_ids:
+                token_ids.extend(part.token_ids[1:])
+            else:
+                token_ids.extend(part.token_ids)
+        return RadixKey(
+            token_ids=token_ids, extra_key=extra_key, is_bigram=self.is_eagle
+        )
+
+    def _collect_nodes_for_key_range_no_split(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[TreeNode]:
+        """Collect complete nodes in [start, end) without changing the tree.
+
+        This is intentionally best-effort: if a node crosses the retention
+        boundary, skip it instead of splitting the radix tree. That keeps this
+        HBM-retention policy from perturbing request locks, load-back state, or
+        eviction bookkeeping.
+        """
+        if end <= start:
+            return []
+
+        nodes = []
+        node = self.root_node
+        pos = 0
+        remaining_key = key
+        while len(remaining_key) > 0 and pos < end:
+            child_key = remaining_key.child_key(self.page_size)
+            child = node.children.get(child_key)
+            if child is None:
+                break
+            child_len = len(child.key)
+            next_pos = pos + child_len
+            if start <= pos and next_pos <= end:
+                nodes.append(child)
+            node = child
+            remaining_key = remaining_key[child_len:]
+            pos = next_pos
+        return nodes
+
+    def _mark_nodes_for_device_evict_after_backup(self, nodes: list[TreeNode]) -> None:
+        for node in nodes:
+            if node is self.root_node or node.evicted:
+                continue
+            if node.backuped and node.lock_ref == 0:
+                self._evict_backuped(node)
+            else:
+                self.pending_device_evict_after_backup.add(node.id)
+
+    def _evict_device_after_backup_if_needed(self, node: TreeNode) -> None:
+        if node.id not in self.pending_device_evict_after_backup:
+            return
+        if node.evicted or not node.backuped or node.lock_ref > 0:
+            return
+        self.pending_device_evict_after_backup.remove(node.id)
+        self._evict_backuped(node)
+
+    def _record_promoted_nodes_for_req(
+        self, req, radix_key: RadixKey, host_start: int, host_end: int
+    ) -> None:
+        """Remember the DRAM-promoted suffix that should not stay in HBM.
+
+        For hybrid IO + write-through, only the first half of the pages loaded
+        from DRAM for this request remain resident in HBM after the request
+        completes; the rest is evicted back to DRAM-only state.
+        """
+        if not self._hybrid_write_through_evict_policy() or req is None:
+            return
+        total_pages = (host_end - host_start) // self.page_size
+        # Keep the head half rounded up, so a single DRAM-hit promotion leaves
+        # at least as many old/visited pages in HBM as it evicts. This reduces
+        # future hybrid transfers for the prefix-nearest pages while remaining
+        # bounded in HBM usage.
+        keep_pages = (total_pages + 1) // 2
+        evict_start = host_start + keep_pages * self.page_size
+        if evict_start >= host_end:
+            return
+
+        # Best-effort only: evict complete nodes that already fit in the tail.
+        # Do not split nodes just to hit the exact half boundary.
+        nodes = self._collect_nodes_for_key_range_no_split(
+            radix_key, evict_start, host_end
+        )
+        if nodes:
+            req.hicache_promote_evict_nodes = nodes
+
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
             try:
@@ -758,6 +867,7 @@ class HiRadixCache(RadixCache):
                         )
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
+                        self._evict_device_after_backup_if_needed(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -786,6 +896,7 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
+                self._evict_device_after_backup_if_needed(backuped_node)
             finish_count -= 1
 
     def loading_check(self):
@@ -972,7 +1083,7 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
 
         start_time = time.perf_counter()
@@ -1035,6 +1146,14 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        if req is not None and self._hybrid_write_through_evict_policy():
+            loaded_key = self._node_prefix_key(last_hit_node).page_aligned(
+                self.page_size
+            )
+            host_end = len(loaded_key)
+            host_start = host_end - len(host_indices)
+            self._record_promoted_nodes_for_req(req, loaded_key, host_start, host_end)
+
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
                 time.perf_counter() - start_time
@@ -1050,7 +1169,7 @@ class HiRadixCache(RadixCache):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+            loading_values = self.load_back(last_node, mem_quota, req=params.req)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
@@ -1493,6 +1612,60 @@ class HiRadixCache(RadixCache):
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
+
+    def cache_finished_req(self, req, is_insert: bool = True):
+        """Cache request when it finishes, with hybrid write-through demotion."""
+        if self.disable_finished_insert:
+            is_insert = False
+
+        kv_committed_len = req.pop_committed_kv_cache()
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        key_len = len(radix_key)
+        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+
+        if is_insert:
+            priority = getattr(req, "priority", 0) or 0
+            result = self.insert(
+                InsertParams(key=radix_key, value=values, priority=priority)
+            )
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : result.prefix_len]
+            )
+            if self._hybrid_write_through_evict_policy():
+                new_nodes = self._collect_nodes_for_key_range_no_split(
+                    radix_key, result.prefix_len, key_len
+                )
+                self._mark_nodes_for_device_evict_after_backup(new_nodes)
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : key_len]
+            )
+
+        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
+
+        if self._hybrid_write_through_evict_policy():
+            for node in getattr(req, "hicache_promote_evict_nodes", []):
+                if node.backuped and not node.evicted and node.lock_ref == 0:
+                    self._evict_backuped(node)
+            if hasattr(req, "hicache_promote_evict_nodes"):
+                delattr(req, "hicache_promote_evict_nodes")
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
