@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +10,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
+from __future__ import annotations
 
 import logging
 import threading
@@ -77,7 +77,9 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index].finish_event.query(), (
+        assert self.events[
+            self.producer_index
+        ].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -632,9 +634,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
-                "tp_lcm_size must be divisible by tp_size."
-            )
+            assert (
+                tp_lcm_size % self.tp_size == 0
+            ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
                 not is_mla_backend
                 and self.mem_pool_host.layout == "page_head"
@@ -832,11 +834,37 @@ class HiCacheController:
 
         if self.io_backend == "hybrid":
             moved_ops = []
+            tail_host_indices = []
+            tail_device_indices = []
             for pending_op in ops:
                 host_indices, device_indices = self.move_indices(
                     pending_op.host_indices, pending_op.device_indices
                 )
-                moved_ops.append((pending_op, host_indices, device_indices))
+                preload_tokens = self._get_hybrid_preload_tokens(
+                    host_indices, pending_op.h2d_preload_pages
+                )
+                moved_ops.append(
+                    (pending_op, host_indices, device_indices, preload_tokens)
+                )
+                if preload_tokens < host_indices.numel():
+                    tail_host_indices.append(host_indices[preload_tokens:])
+                    tail_device_indices.append(device_indices[preload_tokens:])
+
+            if tail_host_indices:
+                merged_tail_host_indices = torch.cat(tail_host_indices)
+                merged_tail_device_indices = torch.cat(tail_device_indices)
+            else:
+                first_host_indices = moved_ops[0][1]
+                first_device_indices = moved_ops[0][2]
+                merged_tail_host_indices = first_host_indices.new_empty((0,))
+                merged_tail_device_indices = first_device_indices.new_empty((0,))
+            if self.has_draft:
+                merged_draft_host_indices = torch.cat(
+                    [host_indices for _, host_indices, _, _ in moved_ops]
+                )
+                merged_draft_device_indices = torch.cat(
+                    [device_indices for _, _, device_indices, _ in moved_ops]
+                )
 
             with device_module.stream(self.load_stream):
                 producer_event.start_event.wait(self.load_stream)
@@ -846,10 +874,7 @@ class HiCacheController:
                 # transfer to reduce small H2D copies and scatter launches.
                 preload_host_indices = []
                 preload_device_indices = []
-                for pending_op, host_indices, device_indices in moved_ops:
-                    preload_tokens = self._get_hybrid_preload_tokens(
-                        host_indices, pending_op.h2d_preload_pages
-                    )
+                for _, host_indices, device_indices, preload_tokens in moved_ops:
                     if preload_tokens > 0:
                         preload_host_indices.append(host_indices[:preload_tokens].cpu())
                         preload_device_indices.append(device_indices[:preload_tokens])
@@ -863,38 +888,29 @@ class HiCacheController:
                     )
 
                 # Transfer the remaining pages like direct H2D, layer by layer,
-                # so the tail can overlap with prefill compute.
+                # so the tail can overlap with prefill compute.  Keep the tail
+                # merged across pending ops to match direct loading's launch
+                # granularity instead of issuing one small copy per op per layer.
                 for i in range(self.layer_num):
-                    for pending_op, host_indices, device_indices in moved_ops:
-                        preload_tokens = self._get_hybrid_preload_tokens(
-                            host_indices, pending_op.h2d_preload_pages
+                    if merged_tail_host_indices.numel() > 0:
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            merged_tail_host_indices,
+                            merged_tail_device_indices,
+                            i,
+                            "direct",
                         )
-                        tail_host_indices = host_indices[preload_tokens:]
-                        tail_device_indices = device_indices[preload_tokens:]
-                        # The tail is empty when the block-DMA preload already
-                        # copied the whole request. Example: host_indices has
-                        # 128 tokens, page_size is 32, and h2d_preload_pages is
-                        # 4, so preload_tokens == 128. In that case there is no
-                        # direct per-layer tail left to transfer.
-                        if tail_host_indices.numel() > 0:
-                            self.mem_pool_host.load_to_device_per_layer(
-                                self.mem_pool_device,
-                                tail_host_indices,
-                                tail_device_indices,
-                                i,
-                                "direct",
-                            )
-                        if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                            self.mem_pool_host_draft.load_to_device_per_layer(
-                                self.mem_pool_device_draft,
-                                host_indices,
-                                device_indices,
-                                i,
-                                "direct",
-                            )
+                    if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            merged_draft_host_indices,
+                            merged_draft_device_indices,
+                            i,
+                            "direct",
+                        )
                     producer_event.complete(i)
 
-                for _, host_indices, device_indices in moved_ops:
+                for _, host_indices, device_indices, _ in moved_ops:
                     if host_indices.is_cuda:
                         host_indices.record_stream(self.load_stream)
                     if device_indices.is_cuda:
