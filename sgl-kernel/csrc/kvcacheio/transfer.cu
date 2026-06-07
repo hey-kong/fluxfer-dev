@@ -992,44 +992,34 @@ __global__ void scatter_kv_block_h2d_kernel(
     int64_t num_pages,
     int64_t num_layers,
     int64_t page_size,
-    int64_t item_size_bytes) {
-  const int64_t layer_id = threadIdx.x;
-  if (layer_id >= num_layers) {
-    return;
-  }
+    int64_t item_size_bytes,
+    int64_t items_per_warp) {
+  const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int32_t lane_id = tid % WARP_SIZE;
+  const int64_t warp_id = tid / WARP_SIZE;
+  constexpr int64_t kv_count = IsMLA ? 1 : 2;
+  const int64_t total_items = num_pages * num_layers * page_size * kv_count;
 
-  const int64_t page_bytes = page_size * item_size_bytes;
-  const int64_t page_chunks = page_bytes / sizeof(uint64_t);
-  const int64_t page_tail_bytes = page_bytes % sizeof(uint64_t);
-  for (int64_t page_id = 0; page_id < num_pages; ++page_id) {
-    const int64_t dst_token_id = dst_indices[page_id * page_size];
-    const int64_t src_layer_offset = (page_id * num_layers * page_size + layer_id * page_size) * item_size_bytes;
-    const char* src_k_ptr = static_cast<const char*>(src_k) + src_layer_offset;
-    char* dst_k_ptr = reinterpret_cast<char*>(dst_k_layer_tbl[layer_id]) + dst_token_id * item_size_bytes;
-
-    const uint64_t* __restrict__ src_k_u64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
-    uint64_t* __restrict__ dst_k_u64 = reinterpret_cast<uint64_t*>(dst_k_ptr);
-    for (int64_t offset = 0; offset < page_chunks; ++offset) {
-      dst_k_u64[offset] = src_k_u64[offset];
-    }
-    for (int64_t offset = 0; offset < page_tail_bytes; ++offset) {
-      const int64_t byte_offset = page_chunks * sizeof(uint64_t) + offset;
-      dst_k_ptr[byte_offset] = src_k_ptr[byte_offset];
+  for (int64_t i = 0; i < items_per_warp; ++i) {
+    int64_t item_id = warp_id * items_per_warp + i;
+    if (item_id >= total_items) {
+      return;
     }
 
-    if constexpr (!IsMLA) {
-      const char* src_v_ptr = static_cast<const char*>(src_v) + src_layer_offset;
-      char* dst_v_ptr = reinterpret_cast<char*>(dst_v_layer_tbl[layer_id]) + dst_token_id * item_size_bytes;
-      const uint64_t* __restrict__ src_v_u64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
-      uint64_t* __restrict__ dst_v_u64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
-      for (int64_t offset = 0; offset < page_chunks; ++offset) {
-        dst_v_u64[offset] = src_v_u64[offset];
-      }
-      for (int64_t offset = 0; offset < page_tail_bytes; ++offset) {
-        const int64_t byte_offset = page_chunks * sizeof(uint64_t) + offset;
-        dst_v_ptr[byte_offset] = src_v_ptr[byte_offset];
-      }
-    }
+    const int64_t kv_id = item_id % kv_count;
+    item_id /= kv_count;
+    const int64_t token_offset = item_id % page_size;
+    item_id /= page_size;
+    const int64_t layer_id = item_id % num_layers;
+    const int64_t page_id = item_id / num_layers;
+
+    const int64_t dst_token_id = dst_indices[page_id * page_size] + token_offset;
+    const int64_t src_offset = ((page_id * num_layers + layer_id) * page_size + token_offset) * item_size_bytes;
+
+    const char* src_ptr = static_cast<const char*>(kv_id == 0 ? src_k : src_v) + src_offset;
+    char* dst_ptr = reinterpret_cast<char*>((kv_id == 0 ? dst_k_layer_tbl : dst_v_layer_tbl)[layer_id]) +
+                    dst_token_id * item_size_bytes;
+    transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
   }
 }
 
@@ -1077,9 +1067,18 @@ void scatter_kv_block_h2d(
         dst_v_ptrs.data_ptr(), dst_v_ptrs_host.data(), num_layers * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
   }
 
-  TORCH_CHECK(num_layers <= 1024, "block H2D scatter requires at most 1024 layers");
-  dim3 grid_dim(1, 1, 1);
-  dim3 block_dim(num_layers, 1, 1);
+  // Use one warp per token-sized KV item. The previous block scatter used one
+  // thread per layer and copied all pages serially inside that thread, which
+  // underutilized the GPU for page-granular block H2D. Warp-level copies match
+  // the generic transfer kernels and parallelize across pages, layers, tokens,
+  // and K/V components while still reading one destination base per page.
+  constexpr int64_t num_warps_per_block = 8;
+  constexpr int64_t items_per_warp = 1;
+  const int64_t kv_count = is_mla ? 1 : 2;
+  const int64_t total_items = num_pages * num_layers * page_size * kv_count;
+  const int64_t num_warps = (total_items + items_per_warp - 1) / items_per_warp;
+  dim3 block_dim(WARP_SIZE * num_warps_per_block, 1, 1);
+  dim3 grid_dim((num_warps + num_warps_per_block - 1) / num_warps_per_block, 1, 1);
   if (is_mla) {
     scatter_kv_block_h2d_kernel<true><<<grid_dim, block_dim, 0, stream>>>(
         src_ptrs[0].data_ptr(),
@@ -1090,7 +1089,8 @@ void scatter_kv_block_h2d(
         num_pages,
         num_layers,
         page_size,
-        item_size);
+        item_size,
+        items_per_warp);
   } else {
     scatter_kv_block_h2d_kernel<false><<<grid_dim, block_dim, 0, stream>>>(
         src_ptrs[0].data_ptr(),
@@ -1101,7 +1101,8 @@ void scatter_kv_block_h2d(
         num_pages,
         num_layers,
         page_size,
-        item_size);
+        item_size,
+        items_per_warp);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
