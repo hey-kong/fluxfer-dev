@@ -282,25 +282,13 @@ class HybridCacheController(BaseHiCacheController):
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             if self.io_backend == "hybrid":
-                # Hybrid D2H uses DMA for the anchor KV pool. Keep sidecar pools
-                # on direct IO because not all of them implement the block backend.
-                anchor = self.mem_pool_host.anchor_entry
-                anchor.host_pool.backup_from_device_all_layer(
-                    anchor.device_pool,
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
                     host_indices,
                     device_indices,
-                    "block",
+                    "direct",
+                    pool_transfers=resolved_pool_transfers,
                 )
-                for transfer in resolved_pool_transfers or []:
-                    entry = self.mem_pool_host.entry_map.get(transfer.name)
-                    if entry is None or transfer.host_indices is None:
-                        continue
-                    entry.host_pool.backup_from_device_all_layer(
-                        entry.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        "direct",
-                    )
             else:
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device,
@@ -368,8 +356,8 @@ class HybridCacheController(BaseHiCacheController):
     ) -> int:
         """Return the page-aligned token prefix that hybrid H2D may preload.
 
-        Block H2D copies complete pages only.  Keep the hybrid direct-tail
-        offset page-aligned so partial pages are still handled by direct H2D.
+        Hybrid H2D preloads complete pages only.  Keep the direct-tail offset
+        page-aligned so partial pages are still handled by direct H2D.
         """
         if h2d_preload_pages <= 0 or host_indices.numel() == 0:
             return 0
@@ -436,24 +424,26 @@ class HybridCacheController(BaseHiCacheController):
             with device_module.stream(self.load_stream):
                 producer_event.start_event.wait(self.load_stream)
 
-                # Preload the prefix-nearest KV pages with DMA. Extra pools keep
-                # the direct path because not all sidecar pools implement block IO.
-                # Merge all KV preload slices into one page-granular block transfer
-                # to reduce small H2D copies and scatter launches.
+                # Preload the prefix-nearest KV pages with the kernel path.
+                # Extra pools stay on the direct tail path. Merge all KV preload
+                # slices to reduce small H2D transfer launches.
                 preload_host_indices = []
                 preload_device_indices = []
                 for _, host_indices, device_indices, _, preload_tokens in moved_ops:
                     if preload_tokens > 0:
-                        preload_host_indices.append(host_indices[:preload_tokens].cpu())
+                        preload_host_indices.append(host_indices[:preload_tokens])
                         preload_device_indices.append(device_indices[:preload_tokens])
                 if preload_host_indices:
-                    self.mem_pool_host.load_to_device_per_layer(
-                        self.mem_pool_device,
-                        torch.cat(preload_host_indices),
-                        torch.cat(preload_device_indices),
-                        0,
-                        "block",
-                    )
+                    merged_preload_host_indices = torch.cat(preload_host_indices)
+                    merged_preload_device_indices = torch.cat(preload_device_indices)
+                    for i in range(self.layer_num):
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            merged_preload_host_indices,
+                            merged_preload_device_indices,
+                            i,
+                            "kernel",
+                        )
 
                 # Transfer the remaining KV pages like direct H2D, layer by layer,
                 # so the tail can overlap with prefill compute.  Keep the tail

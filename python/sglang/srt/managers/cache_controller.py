@@ -727,7 +727,7 @@ class HiCacheController:
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             write_io_backend = (
-                "block" if self.io_backend == "hybrid" else self.io_backend
+                "direct" if self.io_backend == "hybrid" else self.io_backend
             )
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, write_io_backend
@@ -791,14 +791,12 @@ class HiCacheController:
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
-        elif self.io_backend in ["block", "hybrid"]:
+        elif self.io_backend == "hybrid":
             if self.mem_pool_host.layout != "page_first_direct":
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend {self.io_backend!r}"
                 )
-            if self.io_backend == "hybrid":
-                return host_indices, device_indices.cpu()
-            return host_indices.cpu(), device_indices
+            return host_indices, device_indices.cpu()
 
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
@@ -810,10 +808,9 @@ class HiCacheController:
     ) -> int:
         """Return the page-aligned token prefix that hybrid H2D may preload.
 
-        The block H2D path operates on whole pages.  Clamp the requested
+        The hybrid H2D preload operates on whole pages.  Clamp the requested
         preload to the number of complete pages present in ``host_indices`` so
-        a malformed or future caller cannot skip a partial tail that block H2D
-        did not copy.
+        a malformed or future caller cannot skip a partial tail.
         """
         if h2d_preload_pages <= 0 or host_indices.numel() == 0:
             return 0
@@ -869,23 +866,26 @@ class HiCacheController:
             with device_module.stream(self.load_stream):
                 producer_event.start_event.wait(self.load_stream)
 
-                # First preload the request-prefix-nearest pages with DMA.
-                # Merge all pending preload slices into one page-granular block
-                # transfer to reduce small H2D copies and scatter launches.
+                # First preload the request-prefix-nearest pages with the kernel
+                # transfer path. Merge all pending preload slices to reduce
+                # small H2D transfer launches.
                 preload_host_indices = []
                 preload_device_indices = []
                 for _, host_indices, device_indices, preload_tokens in moved_ops:
                     if preload_tokens > 0:
-                        preload_host_indices.append(host_indices[:preload_tokens].cpu())
+                        preload_host_indices.append(host_indices[:preload_tokens])
                         preload_device_indices.append(device_indices[:preload_tokens])
                 if preload_host_indices:
-                    self.mem_pool_host.load_to_device_per_layer(
-                        self.mem_pool_device,
-                        torch.cat(preload_host_indices),
-                        torch.cat(preload_device_indices),
-                        0,
-                        "block",
-                    )
+                    merged_preload_host_indices = torch.cat(preload_host_indices)
+                    merged_preload_device_indices = torch.cat(preload_device_indices)
+                    for i in range(self.layer_num):
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            merged_preload_host_indices,
+                            merged_preload_device_indices,
+                            i,
+                            "kernel",
+                        )
 
                 # Transfer the remaining pages like direct H2D, layer by layer,
                 # so the tail can overlap with prefill compute.  Keep the tail
