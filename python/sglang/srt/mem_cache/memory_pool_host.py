@@ -445,31 +445,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             item_size=self.token_stride_size,
         )
 
-    def _backup_from_device_block_d2h(self, device_pool, host_indices, device_indices):
-        if self.layout != "page_first_direct":
-            raise ValueError(f"Unsupported layout: {self.layout}")
-        num_pages = host_indices.numel() // self.page_size
-        if num_pages == 0:
-            return
-
-        host_indices_cpu = host_indices.cpu()
-        device_indices_cpu = device_indices.cpu()
-        for page_id in range(num_pages):
-            host_page_id = (
-                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
-            )
-            device_start = int(device_indices_cpu[page_id * self.page_size].item())
-            device_end = device_start + self.page_size
-            for layer_id in range(self.layer_num):
-                self.k_buffer[host_page_id, layer_id].copy_(
-                    device_pool.k_buffer[layer_id][device_start:device_end],
-                    non_blocking=True,
-                )
-                self.v_buffer[host_page_id, layer_id].copy_(
-                    device_pool.v_buffer[layer_id][device_start:device_end],
-                    non_blocking=True,
-                )
-
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -688,14 +663,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "block":
-            # Keep the block backend write-back path on ordinary per-page
-            # cudaMemcpyAsync DMA transfers.  In particular, do not call
-            # transfer_kv_all_layer_direct_lf_pf here: that direct helper may
-            # use cudaMemcpyBatchAsync on some builds, and cuMemcpyBatchAsync_v2
-            # can segfault in the CUDA runtime before returning an error.
-            self._backup_from_device_block_d2h(
-                device_pool, host_indices, device_indices
-            )
+            if self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
+                    dst_ptrs=[self.k_buffer, self.v_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
                 transfer_kv_dim_exchange(
@@ -1060,27 +1037,6 @@ class MLATokenToKVPoolHost(HostKVCache):
             item_size=self.token_stride_size,
         )
 
-    def _backup_from_device_block_d2h(self, device_pool, host_indices, device_indices):
-        if self.layout != "page_first_direct":
-            raise ValueError(f"Unsupported layout: {self.layout}")
-        num_pages = host_indices.numel() // self.page_size
-        if num_pages == 0:
-            return
-
-        host_indices_cpu = host_indices.cpu()
-        device_indices_cpu = device_indices.cpu()
-        for page_id in range(num_pages):
-            host_page_id = (
-                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
-            )
-            device_start = int(device_indices_cpu[page_id * self.page_size].item())
-            device_end = device_start + self.page_size
-            for layer_id in range(self.layer_num):
-                self.kv_buffer[host_page_id, layer_id].copy_(
-                    device_pool.kv_buffer[layer_id][device_start:device_end],
-                    non_blocking=True,
-                )
-
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
@@ -1241,14 +1197,16 @@ class MLATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "block":
-            # Keep the block backend write-back path on ordinary per-page
-            # cudaMemcpyAsync DMA transfers.  In particular, do not call
-            # transfer_kv_all_layer_direct_lf_pf here: that direct helper may
-            # use cudaMemcpyBatchAsync on some builds, and cuMemcpyBatchAsync_v2
-            # can segfault in the CUDA runtime before returning an error.
-            self._backup_from_device_block_d2h(
-                device_pool, host_indices, device_indices
-            )
+            if self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.kv_buffer,
+                    dst_ptrs=[self.kv_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
                 transfer_kv_dim_exchange(
