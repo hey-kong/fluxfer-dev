@@ -1,5 +1,4 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/ops/empty.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
@@ -751,7 +750,7 @@ inline void transfer_kv_page_first_direct_impl(
   int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
   int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
-  auto direct_page_copy = [&]() {
+  auto fallback_to_page_copy = [&]() {
     if constexpr (IsLf2Pf) {
       const bool is_mla = dst_ptrs.size() == 1;
       const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
@@ -793,20 +792,8 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
-  // D2H page_first_direct is used by both the direct backend and the block
-  // backend write-back path. Do not route D2H through cudaMemcpyBatchAsync:
-  // CUDA 13 runtimes/drivers have been observed to segfault inside
-  // cuMemcpyBatchAsync_v2 before returning an error to PyTorch. The per-page
-  // tensor copies below still enqueue non-blocking DMA transfers on the current
-  // stream, matching the direct backend semantics without touching the unstable
-  // batched runtime entry point.
-  if constexpr (IsLf2Pf) {
-    direct_page_copy();
-    return;
-  }
-
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
-  direct_page_copy();
+  fallback_to_page_copy();
   return;
 
 #else
@@ -814,14 +801,14 @@ inline void transfer_kv_page_first_direct_impl(
   int driver_version = 0;
   cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
   if (driver_version_err != cudaSuccess || driver_version < 12080) {
-    direct_page_copy();
+    fallback_to_page_copy();
     return;
   }
 
   // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
   static void* cuda_memcpy_batch_async_sym = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
   if (cuda_memcpy_batch_async_sym == nullptr) {
-    direct_page_copy();
+    fallback_to_page_copy();
     return;
   }
 
@@ -837,7 +824,7 @@ inline void transfer_kv_page_first_direct_impl(
   static int runtime_version = 0;
   static cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
   if (runtime_version_err != cudaSuccess) {
-    direct_page_copy();
+    fallback_to_page_copy();
     return;
   }
   static const bool use_v13_signature = runtime_version >= 13000;
@@ -972,7 +959,7 @@ inline void transfer_kv_page_first_direct_impl(
              stream);
     }
     if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
-      direct_page_copy();
+      fallback_to_page_copy();
       return;
     }
     if (err != cudaSuccess) {
@@ -980,131 +967,6 @@ inline void transfer_kv_page_first_direct_impl(
     }
   }
 #endif
-}
-
-template <bool IsMLA>
-__global__ void scatter_kv_block_h2d_kernel(
-    const void* __restrict__ src_k,
-    const void* __restrict__ src_v,
-    const int64_t* __restrict__ dst_indices,
-    const uintptr_t* __restrict__ dst_k_layer_tbl,
-    const uintptr_t* __restrict__ dst_v_layer_tbl,
-    int64_t num_pages,
-    int64_t num_layers,
-    int64_t page_size,
-    int64_t item_size_bytes,
-    int64_t items_per_warp) {
-  const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int32_t lane_id = tid % WARP_SIZE;
-  const int64_t warp_id = tid / WARP_SIZE;
-  constexpr int64_t kv_count = IsMLA ? 1 : 2;
-  const int64_t total_items = num_pages * num_layers * page_size * kv_count;
-
-  for (int64_t i = 0; i < items_per_warp; ++i) {
-    int64_t item_id = warp_id * items_per_warp + i;
-    if (item_id >= total_items) {
-      return;
-    }
-
-    const int64_t kv_id = item_id % kv_count;
-    item_id /= kv_count;
-    const int64_t token_offset = item_id % page_size;
-    item_id /= page_size;
-    const int64_t layer_id = item_id % num_layers;
-    const int64_t page_id = item_id / num_layers;
-
-    const int64_t dst_token_id = dst_indices[page_id * page_size] + token_offset;
-    const int64_t src_offset = ((page_id * num_layers + layer_id) * page_size + token_offset) * item_size_bytes;
-
-    const char* src_ptr = static_cast<const char*>(kv_id == 0 ? src_k : src_v) + src_offset;
-    char* dst_ptr = reinterpret_cast<char*>((kv_id == 0 ? dst_k_layer_tbl : dst_v_layer_tbl)[layer_id]) +
-                    dst_token_id * item_size_bytes;
-    transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
-  }
-}
-
-void scatter_kv_block_h2d(
-    const std::vector<at::Tensor>& src_ptrs,
-    const std::vector<at::Tensor>& dst_ptrs,
-    const at::Tensor& dst_indices,
-    int64_t page_size,
-    int64_t item_size) {
-  TORCH_CHECK(!src_ptrs.empty(), "Source pointers must not be empty");
-  TORCH_CHECK(!dst_ptrs.empty(), "Destination pointers must not be empty");
-  TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
-  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
-  TORCH_CHECK(page_size > 0, "Page size must be positive");
-  TORCH_CHECK(dst_indices.numel() % page_size == 0, "Destination indices size must be divisible by page size");
-  TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
-
-  const bool is_mla = src_ptrs.size() == 1;
-  const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
-  TORCH_CHECK(num_layers > 0, "Number of destination layers must be positive");
-  TORCH_CHECK(
-      is_mla || static_cast<int64_t>(dst_ptrs.size()) == num_layers * 2,
-      "MHA destination pointers must contain K layers followed by V layers");
-  const int64_t num_pages = dst_indices.numel() / page_size;
-  if (num_pages == 0) {
-    return;
-  }
-
-  std::vector<uintptr_t> dst_k_ptrs_host(num_layers);
-  std::vector<uintptr_t> dst_v_ptrs_host(is_mla ? 0 : num_layers);
-  for (int64_t i = 0; i < num_layers; ++i) {
-    dst_k_ptrs_host[i] = reinterpret_cast<uintptr_t>(dst_ptrs[i].data_ptr());
-    if (!is_mla) {
-      dst_v_ptrs_host[i] = reinterpret_cast<uintptr_t>(dst_ptrs[i + num_layers].data_ptr());
-    }
-  }
-  auto options = at::TensorOptions().dtype(at::kLong).device(dst_indices.device());
-  at::Tensor dst_k_ptrs = at::empty({num_layers}, options);
-  at::Tensor dst_v_ptrs = is_mla ? at::Tensor() : at::empty({num_layers}, options);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaMemcpyAsync(
-      dst_k_ptrs.data_ptr(), dst_k_ptrs_host.data(), num_layers * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
-  if (!is_mla) {
-    C10_CUDA_CHECK(cudaMemcpyAsync(
-        dst_v_ptrs.data_ptr(), dst_v_ptrs_host.data(), num_layers * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
-  }
-
-  // Use one warp per token-sized KV item. The previous block scatter used one
-  // thread per layer and copied all pages serially inside that thread, which
-  // underutilized the GPU for page-granular block H2D. Warp-level copies match
-  // the generic transfer kernels and parallelize across pages, layers, tokens,
-  // and K/V components while still reading one destination base per page.
-  constexpr int64_t num_warps_per_block = 8;
-  constexpr int64_t items_per_warp = 1;
-  const int64_t kv_count = is_mla ? 1 : 2;
-  const int64_t total_items = num_pages * num_layers * page_size * kv_count;
-  const int64_t num_warps = (total_items + items_per_warp - 1) / items_per_warp;
-  dim3 block_dim(WARP_SIZE * num_warps_per_block, 1, 1);
-  dim3 grid_dim((num_warps + num_warps_per_block - 1) / num_warps_per_block, 1, 1);
-  if (is_mla) {
-    scatter_kv_block_h2d_kernel<true><<<grid_dim, block_dim, 0, stream>>>(
-        src_ptrs[0].data_ptr(),
-        nullptr,
-        dst_indices.data_ptr<int64_t>(),
-        reinterpret_cast<uintptr_t*>(dst_k_ptrs.data_ptr<int64_t>()),
-        nullptr,
-        num_pages,
-        num_layers,
-        page_size,
-        item_size,
-        items_per_warp);
-  } else {
-    scatter_kv_block_h2d_kernel<false><<<grid_dim, block_dim, 0, stream>>>(
-        src_ptrs[0].data_ptr(),
-        src_ptrs[1].data_ptr(),
-        dst_indices.data_ptr<int64_t>(),
-        reinterpret_cast<uintptr_t*>(dst_k_ptrs.data_ptr<int64_t>()),
-        reinterpret_cast<uintptr_t*>(dst_v_ptrs.data_ptr<int64_t>()),
-        num_pages,
-        num_layers,
-        page_size,
-        item_size,
-        items_per_warp);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void transfer_kv_per_layer_direct_pf_lf(
