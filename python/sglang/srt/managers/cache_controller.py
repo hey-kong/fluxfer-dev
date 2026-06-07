@@ -826,19 +826,26 @@ class HiCacheController:
                 producer_event.start_event.wait(self.load_stream)
 
                 # First preload the request-prefix-nearest pages with DMA.
+                # Merge all pending preload slices into one page-granular block
+                # transfer to reduce small H2D copies and scatter launches.
+                preload_host_indices = []
+                preload_device_indices = []
                 for pending_op, host_indices, device_indices in moved_ops:
                     preload_tokens = min(
                         pending_op.h2d_preload_pages * self.page_size,
                         host_indices.numel(),
                     )
                     if preload_tokens > 0:
-                        self.mem_pool_host.load_to_device_per_layer(
-                            self.mem_pool_device,
-                            host_indices[:preload_tokens].cpu(),
-                            device_indices[:preload_tokens],
-                            0,
-                            "block",
-                        )
+                        preload_host_indices.append(host_indices[:preload_tokens].cpu())
+                        preload_device_indices.append(device_indices[:preload_tokens])
+                if preload_host_indices:
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        torch.cat(preload_host_indices),
+                        torch.cat(preload_device_indices),
+                        0,
+                        "block",
+                    )
 
                 # Transfer the remaining pages like direct H2D, layer by layer,
                 # so the tail can overlap with prefill compute.

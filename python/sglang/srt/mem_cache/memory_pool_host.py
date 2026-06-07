@@ -395,50 +395,90 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def _ensure_block_h2d_staging_buffers(self, num_pages: int, device):
+        # Keep capacity-based staging buffers instead of reallocating whenever a
+        # request has a different number of pages. The block copy only uses the
+        # leading ``num_pages`` slice, while the cached allocation can be reused by
+        # later smaller block transfers.
+        capacity = getattr(self, "_block_buffer_capacity_pages", 0)
+        has_buffer = hasattr(self, "_block_k_buffer")
+        device_changed = has_buffer and self._block_k_buffer.device != device
+        needs_alloc = capacity < num_pages or not has_buffer or device_changed
+        if needs_alloc:
+            reusable_capacity = 0 if device_changed else capacity
+            new_capacity = max(num_pages, reusable_capacity * 2, 1)
+            shape = (
+                new_capacity,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+            self._block_k_buffer = torch.empty(shape, dtype=self.dtype, device=device)
+            self._block_v_buffer = torch.empty(shape, dtype=self.dtype, device=device)
+            self._block_buffer_capacity_pages = new_capacity
+
+        return self._block_k_buffer[:num_pages], self._block_v_buffer[:num_pages]
+
+    def _stage_block_h2d_pages(self, block_k_buffer, block_v_buffer, host_indices_cpu):
+        # Preserve page-granularity semantics while coalescing physically
+        # contiguous host pages into larger H2D copies. This reduces copy-launch
+        # overhead for small page sizes without changing the scatter mapping.
+        num_pages = block_k_buffer.shape[0]
+        host_page_ids = (
+            host_indices_cpu[: num_pages * self.page_size : self.page_size]
+            .div(self.page_size, rounding_mode="floor")
+            .tolist()
+        )
+
+        run_start = 0
+        src_start = int(host_page_ids[0])
+        prev_page_id = src_start
+        for page_id, host_page_id in enumerate(host_page_ids[1:], start=1):
+            host_page_id = int(host_page_id)
+            if host_page_id == prev_page_id + 1:
+                prev_page_id = host_page_id
+                continue
+
+            block_k_buffer[run_start:page_id].copy_(
+                self.k_buffer[src_start : src_start + page_id - run_start],
+                non_blocking=True,
+            )
+            block_v_buffer[run_start:page_id].copy_(
+                self.v_buffer[src_start : src_start + page_id - run_start],
+                non_blocking=True,
+            )
+            run_start = page_id
+            src_start = host_page_id
+            prev_page_id = host_page_id
+
+        block_k_buffer[run_start:num_pages].copy_(
+            self.k_buffer[src_start : src_start + num_pages - run_start],
+            non_blocking=True,
+        )
+        block_v_buffer[run_start:num_pages].copy_(
+            self.v_buffer[src_start : src_start + num_pages - run_start],
+            non_blocking=True,
+        )
+
     def _load_to_device_block_h2d(self, device_pool, host_indices, device_indices):
         if self.layout != "page_first_direct":
             raise ValueError(f"Unsupported layout: {self.layout}")
         num_pages = host_indices.numel() // self.page_size
         if num_pages == 0:
             return
-        # The staging buffer is sized for the current merged load operation and
-        # cached for reuse. All requested pages are copied into this buffer before
-        # the single scatter kernel runs; this is not a per-page copy/scatter loop.
-        # MHA allocates one K buffer and one V buffer, so total temporary GPU bytes
-        # are 2 * prod(shape) * dtype.itemsize.
-        shape = (
-            num_pages,
-            self.layer_num,
-            self.page_size,
-            self.head_num,
-            self.head_dim,
+        # Staging buffers are reused by capacity, then sliced to the current
+        # number of pages. All requested pages are staged before the single
+        # scatter kernel runs; this is not a per-page scatter loop.
+        block_k_buffer, block_v_buffer = self._ensure_block_h2d_staging_buffers(
+            num_pages, device_pool.device
         )
-        if (
-            not hasattr(self, "_block_k_buffer")
-            or self._block_k_buffer.shape != shape
-            or self._block_k_buffer.device != device_pool.device
-        ):
-            self._block_k_buffer = torch.empty(
-                shape, dtype=self.dtype, device=device_pool.device
-            )
-            self._block_v_buffer = torch.empty(
-                shape, dtype=self.dtype, device=device_pool.device
-            )
 
         host_indices_cpu = host_indices.cpu()
-        for page_id in range(num_pages):
-            host_page_id = (
-                int(host_indices_cpu[page_id * self.page_size].item()) // self.page_size
-            )
-            self._block_k_buffer[page_id].copy_(
-                self.k_buffer[host_page_id], non_blocking=True
-            )
-            self._block_v_buffer[page_id].copy_(
-                self.v_buffer[host_page_id], non_blocking=True
-            )
+        self._stage_block_h2d_pages(block_k_buffer, block_v_buffer, host_indices_cpu)
 
         scatter_kv_block_h2d(
-            src_ptrs=[self._block_k_buffer, self._block_v_buffer],
+            src_ptrs=[block_k_buffer, block_v_buffer],
             dst_ptrs=device_pool.k_buffer + device_pool.v_buffer,
             dst_indices=device_indices,
             page_size=self.page_size,
