@@ -405,6 +405,24 @@ class Scheduler(
         self.priority_scheduling_preemption_threshold = (
             server_args.priority_scheduling_preemption_threshold
         )
+        # NOTE: preemption is enabled by default for priority scheduling.
+        self.enable_priority_preemption = (
+            self.enable_priority_scheduling
+            and not self.server_args.disable_priority_preemption
+        )
+        self.init_new_token_ratio = min(
+            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
+            * self.server_args.schedule_conservativeness,
+            1.0,
+        )
+        self.min_new_token_ratio = min(
+            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
+            1.0,
+        )
+        self.new_token_ratio_decay = (
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
+        self.new_token_ratio = self.init_new_token_ratio
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
@@ -1507,26 +1525,6 @@ class Scheduler(
             )
             if status == "stop":
                 return
-
-        # NOTE: preemption is enabled by default for priority scheduling.
-        self.enable_priority_preemption = (
-            self.enable_priority_scheduling
-            and not self.server_args.disable_priority_preemption
-        )
-
-        self.init_new_token_ratio = min(
-            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
-            * self.server_args.schedule_conservativeness,
-            1.0,
-        )
-        self.min_new_token_ratio = min(
-            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
-            1.0,
-        )
-        self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
-        self.new_token_ratio = self.init_new_token_ratio
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
