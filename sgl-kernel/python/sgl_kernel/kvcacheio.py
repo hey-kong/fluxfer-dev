@@ -192,18 +192,6 @@ def transfer_kv_direct(
     )
 
 
-def scatter_kv_block_h2d(
-    src_ptrs: List[torch.Tensor],
-    dst_ptrs: List[torch.Tensor],
-    dst_indices: torch.Tensor,
-    page_size: int,
-    item_size: int,
-):
-    torch.ops.sgl_kernel.scatter_kv_block_h2d.default(
-        src_ptrs, dst_ptrs, dst_indices, page_size, item_size
-    )
-
-
 def transfer_kv_per_layer_direct_pf_lf(
     src_ptrs: List[torch.Tensor],
     dst_ptrs: List[torch.Tensor],

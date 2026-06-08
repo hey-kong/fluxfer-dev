@@ -3492,20 +3492,17 @@ class ServerArgs:
                 "Page first layout is not supported with direct IO backend, switching to page first direct layout"
             )
 
-        if self.hicache_io_backend in ["block", "hybrid"]:
+        if self.hicache_io_backend == "hybrid":
             if self.hicache_mem_layout == "page_first":
                 self.hicache_mem_layout = "page_first_direct"
                 logger.warning(
-                    f"Page first layout is not supported with {self.hicache_io_backend} IO backend, switching to page first direct layout"
+                    "Page first layout is not supported with hybrid IO backend, switching to page first direct layout"
                 )
             elif self.hicache_mem_layout != "page_first_direct":
                 raise ValueError(
-                    f"{self.hicache_io_backend} hicache_io_backend requires hicache_mem_layout to be page_first_direct"
+                    "hybrid hicache_io_backend requires hicache_mem_layout to be page_first_direct"
                 )
-            if (
-                self.hicache_io_backend == "hybrid"
-                and self.hicache_storage_backend is not None
-            ):
+            if self.hicache_storage_backend is not None:
                 raise ValueError(
                     "hybrid hicache_io_backend requires HiCache to use only HBM and DRAM; "
                     "disable hicache_storage_backend"
@@ -3518,7 +3515,7 @@ class ServerArgs:
         ):
             return
 
-        if self.hicache_io_backend in ["direct", "block", "hybrid"]:
+        if self.hicache_io_backend in ["direct", "hybrid"]:
             new_layout = "page_first_direct"
         elif self.hicache_io_backend == "kernel":
             new_layout = "page_first"
@@ -6272,7 +6269,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend", "block", "hybrid"],
+            choices=["direct", "kernel", "kernel_ascend", "hybrid"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
