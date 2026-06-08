@@ -1354,8 +1354,7 @@ class Scheduler(
         next_load = state.load_tokens + estimate.extra_load_tokens
         next_compute = state.compute_tokens + estimate.compute_tokens
         return (
-            next_load / max(next_compute, 1)
-            <= HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
+            next_load / max(next_compute, 1) <= HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
         )
 
     @staticmethod
@@ -1376,6 +1375,19 @@ class Scheduler(
             remaining_loaded -= seg_len
         state.compute_tokens += max(compute_tokens, 0)
 
+    @staticmethod
+    def _hybrid_bbf_is_bundle_hit(
+        anchor_estimate: HybridBalancedPrefillEstimate,
+        candidate_estimate: HybridBalancedPrefillEstimate,
+    ) -> bool:
+        anchor_segment_ids = {seg_id for seg_id, _ in anchor_estimate.load_segments}
+        if not anchor_segment_ids:
+            return False
+        return any(
+            seg_id in anchor_segment_ids
+            for seg_id, _ in candidate_estimate.load_segments
+        )
+
     def _form_hybrid_balanced_prefill_batch(
         self,
         adder: PrefillAdder,
@@ -1383,11 +1395,13 @@ class Scheduler(
     ) -> None:
         """Build a prefill batch that balances host KV loading and compute.
 
-        The first pass preserves FIFO fairness by scanning from the queue head,
-        admitting requests whose host-load / compute ratio stays under the
-        hybrid loading bound and deferring loading-heavy candidates.  Later
-        passes retry deferred requests in original order, first with the ratio
-        guard and finally as a soft fallback so no request is dropped or starved.
+        The first pass preserves FIFO fairness by scanning from the queue head.
+        When a request is admitted without crossing the loading-bound ratio, the
+        scheduler immediately scans the remaining queue for bundle hits that
+        share the admitted request's host-cache segments and admits them first.
+        Requests that would make the batch loading-bound are moved to a
+        deprioritized list.  If the queue scan finishes with budget left, the
+        deprioritized requests are used as FIFO backfill to avoid starvation.
         """
         bbf_state = HybridBalancedPrefillState()
         for existing_req in adder.can_run_list:
@@ -1396,7 +1410,8 @@ class Scheduler(
             # host-heavy requests can pair with it.
             bbf_state.compute_tokens += max(int(existing_req.extend_input_len), 0)
         deprioritized: List[Req] = []
-        remaining_deprioritized: List[Req] = []
+        deprioritized_ids: set[int] = set()
+        admitted_ids: set[int] = {id(req) for req in adder.can_run_list}
 
         def hard_stop_or_full(req: Req) -> bool:
             running_bs = len(self.running_batch.reqs)
@@ -1407,9 +1422,8 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     return True
             return False
@@ -1426,29 +1440,42 @@ class Scheduler(
                 )
                 req.mamba_pool_idx = None
 
+        def remember_deprioritized(req: Req) -> None:
+            req_id = id(req)
+            if req_id not in deprioritized_ids and req_id not in admitted_ids:
+                deprioritized.append(req)
+                deprioritized_ids.add(req_id)
+
         def try_admit(
             req: Req,
             *,
             enforce_ratio: bool,
             collect_deprioritized: bool,
-        ) -> str:
+            precomputed_estimate: Optional[HybridBalancedPrefillEstimate] = None,
+            already_initialized: bool = False,
+        ) -> Tuple[str, Optional[HybridBalancedPrefillEstimate]]:
+            if id(req) in admitted_ids:
+                return "continue", None
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                return "continue"
+                return "continue", None
 
             if hard_stop_or_full(req):
-                return "stop"
+                return "stop", None
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # Skip staging requests that are still waiting for L3 prefetch.
-                    return "continue"
+                    return "continue", None
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
-            estimate = self._hybrid_bbf_estimate_req(req, adder, bbf_state)
+            if not already_initialized:
+                req.init_next_round_input(self.tree_cache)
+            estimate = precomputed_estimate or self._hybrid_bbf_estimate_req(
+                req, adder, bbf_state
+            )
             if enforce_ratio and not self._hybrid_bbf_should_admit(
                 req, adder, bbf_state, estimate
             ):
@@ -1457,8 +1484,8 @@ class Scheduler(
                 # before add_one_req takes ownership, release those reservations.
                 free_unadded_mamba_idx(req)
                 if collect_deprioritized:
-                    deprioritized.append(req)
-                return "deprioritized"
+                    remember_deprioritized(req)
+                return "deprioritized", estimate
 
             prefix_len_before = len(req.prefix_indices)
             res = adder.add_one_req(
@@ -1472,6 +1499,7 @@ class Scheduler(
 
             added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
             if added:
+                admitted_ids.add(id(req))
                 loaded_tokens = max(len(req.prefix_indices) - prefix_len_before, 0)
                 # After add_one_req, extend_input_len reflects the actual suffix
                 # admitted to this prefill batch (including chunk truncation).
@@ -1489,36 +1517,65 @@ class Scheduler(
                         not self.running_batch.is_empty()
                     )
                 free_unadded_mamba_idx(req)
-                return "stop"
-            return "continue"
+                return "stop", estimate
+            return "admitted" if added else "continue", estimate
 
-        for req in self.waiting_queue:
-            status = try_admit(
+        def prioritize_bundle_hits(
+            anchor_estimate: HybridBalancedPrefillEstimate,
+            start_index: int,
+        ) -> bool:
+            if not anchor_estimate.load_segments:
+                return False
+            for candidate_index, candidate in enumerate(
+                self.waiting_queue[start_index:], start=start_index
+            ):
+                if id(candidate) in admitted_ids or id(candidate) in deprioritized_ids:
+                    continue
+                if self.enable_lora and not self._can_schedule_lora_req(
+                    candidate, running_loras
+                ):
+                    continue
+                candidate.init_next_round_input(self.tree_cache)
+                candidate_estimate = self._hybrid_bbf_estimate_req(
+                    candidate, adder, bbf_state
+                )
+                if not self._hybrid_bbf_is_bundle_hit(
+                    anchor_estimate, candidate_estimate
+                ):
+                    free_unadded_mamba_idx(candidate)
+                    continue
+                status, admitted_estimate = try_admit(
+                    candidate,
+                    enforce_ratio=True,
+                    collect_deprioritized=True,
+                    precomputed_estimate=candidate_estimate,
+                    already_initialized=True,
+                )
+                if status == "stop":
+                    return True
+                if status == "admitted" and admitted_estimate is not None:
+                    if prioritize_bundle_hits(admitted_estimate, candidate_index + 1):
+                        return True
+            return False
+
+        for req_index, req in enumerate(self.waiting_queue):
+            if id(req) in admitted_ids or id(req) in deprioritized_ids:
+                continue
+            status, estimate = try_admit(
                 req,
                 enforce_ratio=True,
                 collect_deprioritized=True,
             )
             if status == "stop":
                 return
+            if status == "admitted" and estimate is not None:
+                if prioritize_bundle_hits(estimate, req_index + 1):
+                    return
 
-        # Retry deferred requests in FIFO order after compute-heavy requests may
-        # have lowered the aggregate ratio enough for them to fit cleanly.
+        # FIFO backfill from the deprioritized list after all ratio-preserving
+        # normal and bundle-hit opportunities have been tried.
         for req in deprioritized:
-            status = try_admit(
-                req,
-                enforce_ratio=True,
-                collect_deprioritized=False,
-            )
-            if status == "stop":
-                return
-            if status == "deprioritized":
-                remaining_deprioritized.append(req)
-
-        # Soft fallback: fill remaining budget in original deferred order.  This
-        # can break the ratio, but only after all ratio-preserving options have
-        # been tried, which prevents starvation and preserves throughput.
-        for req in remaining_deprioritized:
-            status = try_admit(
+            status, _ = try_admit(
                 req,
                 enforce_ratio=False,
                 collect_deprioritized=False,
@@ -3108,9 +3165,7 @@ class Scheduler(
                     continue
 
                 running_bs = len(self.running_batch.reqs)
-                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
-                    running_bs
-                ):
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                     self.running_batch.batch_is_full = True
                 if self.disaggregation_mode == DisaggregationMode.PREFILL:
                     # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -3226,8 +3281,7 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
             new_batch.hybrid_bubble_needs_preload = (
-                hybrid_preload_pages_pending
-                and new_batch.hicache_consumer_index >= 0
+                hybrid_preload_pages_pending and new_batch.hicache_consumer_index >= 0
             )
 
         new_batch.prepare_for_extend()

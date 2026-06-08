@@ -10,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_policy import AddReqResult  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
     HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO,
     HybridBalancedPrefillState,
@@ -23,7 +24,9 @@ class _Node:
     def __init__(self, node_id, parent=None, host_len=0, on_device=True):
         self.id = node_id
         self.parent = parent
-        self.host_value = torch.arange(host_len, dtype=torch.int64) if host_len else None
+        self.host_value = (
+            torch.arange(host_len, dtype=torch.int64) if host_len else None
+        )
         self.value = (
             torch.arange(host_len, dtype=torch.int64)
             if on_device and host_len
@@ -39,8 +42,12 @@ def _req(**kwargs):
         best_match_node=None,
         last_node=None,
         time_stats=SimpleNamespace(wait_queue_entry_time=0.0),
+        mamba_pool_idx=None,
+        prefix_indices=None,
     )
     defaults.update(kwargs)
+    if defaults["prefix_indices"] is None:
+        defaults["prefix_indices"] = []
     return SimpleNamespace(**defaults)
 
 
@@ -68,7 +75,6 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         scheduler.server_args.enable_hybrid_balanced_batch = True
         scheduler.tree_cache.cache_controller.io_backend = "direct"
         self.assertFalse(scheduler._is_hybrid_balanced_prefill_enabled())
-
 
     def test_bubble_filling_requires_flag_and_unfinished_preload(self):
         root = _Node(0)
@@ -150,6 +156,84 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         self.assertEqual(estimate.extra_load_tokens, 7)
         self.assertEqual(estimate.compute_tokens, 3)
         self.assertLessEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 8.0)
+
+    def test_balanced_prefill_prioritizes_bundle_hits_after_anchor(self):
+        root = _Node(0)
+        shared = _Node(1, parent=root, host_len=8, on_device=False)
+        unrelated = _Node(2, parent=root, host_len=1, on_device=False)
+        scheduler = self._scheduler(root)
+        scheduler.enable_lora = False
+        scheduler.enable_hicache_storage = False
+        scheduler.enable_priority_preemption = False
+        scheduler.disaggregation_mode = None
+        scheduler.chunked_req = None
+        scheduler.truncation_align_size = None
+
+        def running_batch_is_empty():
+            return True
+
+        def get_num_allocatable_reqs(_running_bs):
+            return 10
+
+        scheduler.running_batch = SimpleNamespace(
+            reqs=[], batch_is_full=False, is_empty=running_batch_is_empty
+        )
+        scheduler.get_num_allocatable_reqs = get_num_allocatable_reqs
+
+        def init_next_round_input(req):
+            req.prefix_indices = []
+
+        anchor = _req(
+            rid="anchor",
+            host_hit_length=8,
+            extend_input_len=9,
+            best_match_node=shared,
+            last_node=root,
+        )
+        fifo_next = _req(
+            rid="fifo-next",
+            host_hit_length=1,
+            extend_input_len=9,
+            best_match_node=unrelated,
+            last_node=root,
+        )
+        bundle_hit = _req(
+            rid="bundle-hit",
+            host_hit_length=8,
+            extend_input_len=9,
+            best_match_node=shared,
+            last_node=root,
+        )
+
+        def make_init_next_round_input(req):
+            def _init_next_round_input(_tree_cache):
+                init_next_round_input(req)
+
+            return _init_next_round_input
+
+        for req in (anchor, fifo_next, bundle_hit):
+            req.init_next_round_input = make_init_next_round_input(req)
+        scheduler.waiting_queue = [anchor, fifo_next, bundle_hit]
+
+        class _Adder:
+            rem_chunk_tokens = None
+
+            def __init__(self):
+                self.can_run_list = []
+
+            def add_one_req(self, req, **_kwargs):
+                req.prefix_indices = [0] * req.host_hit_length
+                self.can_run_list.append(req)
+                return AddReqResult.CONTINUE
+
+        adder = _Adder()
+
+        scheduler._form_hybrid_balanced_prefill_batch(adder, running_loras=None)
+
+        self.assertEqual(
+            [req.rid for req in adder.can_run_list],
+            ["anchor", "bundle-hit", "fifo-next"],
+        )
 
     def test_ratio_guard_rejects_loading_heavy_non_empty_batch(self):
         scheduler = self._scheduler(_Node(0))
