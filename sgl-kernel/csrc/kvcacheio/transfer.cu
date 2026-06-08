@@ -103,6 +103,22 @@ __device__ __forceinline__ T* get_global_offset_per_head_lf_tbl(
 }
 
 template <typename T>
+__device__ __forceinline__ T* get_global_offset_pfd(
+    T* base,
+    const uintptr_t* __restrict__ /*unused*/,
+    int64_t layer_id,
+    int64_t page_dim,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t /*head_id*/,
+    int64_t /*head_num*/,
+    int64_t page_size) {
+  // page_first_direct layout: [page_num, layer_num, page_size, ...]
+  return base + page_id / page_size * page_dim + layer_id * page_size * item_size_bytes +
+         page_id % page_size * item_size_bytes;
+}
+
+template <typename T>
 __device__ __forceinline__ T* get_global_offset_ph(
     T* base,
     const uintptr_t* __restrict__ /*unused*/,
@@ -409,6 +425,42 @@ void transfer_kv_per_layer_pf_lf(
       num_warps_per_block);
 }
 
+void transfer_kv_per_layer_pfd_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_pfd<const char>, get_global_offset_per_head_lf<char>, false, true>(
+      src_k,
+      dst_k,
+      src_v,
+      dst_v,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      1);
+}
+
 void transfer_kv_per_layer_ph_lf(
     const at::Tensor src_k,
     at::Tensor dst_k,
@@ -578,6 +630,40 @@ void transfer_kv_per_layer_mla(
       empty,
       block_quota,
       num_warps_per_block);
+}
+
+void transfer_kv_per_layer_mla_pfd_lf(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_pfd<const char>, get_global_offset_per_head_lf<char>, true, true>(
+      src,
+      dst,
+      empty,
+      empty,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      1);
 }
 
 void transfer_kv_per_layer_mla_pf_lf(

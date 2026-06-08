@@ -1214,6 +1214,27 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_write_through[node.id] = (node, lock_params)
         return len(host_indices)
 
+    def _get_hybrid_h2d_preload_pages(self, host_tokens: int, req) -> int:
+        if (
+            self.cache_controller is None
+            or self.cache_controller.io_backend != "hybrid"
+            or host_tokens <= 0
+        ):
+            return 0
+
+        compute_tokens = max(req.extend_input_len - host_tokens, 0)
+        total_pages = (host_tokens + self.page_size - 1) // self.page_size
+        if compute_tokens == 0:
+            return total_pages
+
+        max_overlap_tokens = 8 * compute_tokens
+        if host_tokens <= max_overlap_tokens:
+            return 0
+
+        preload_tokens = host_tokens - max_overlap_tokens
+        preload_pages = (preload_tokens + self.page_size - 1) // self.page_size
+        return min(max(preload_pages, 0), total_pages)
+
     def load_back(
         self,
         best_match_node: UnifiedTreeNode,
@@ -1268,10 +1289,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        h2d_preload_pages = self._get_hybrid_h2d_preload_pages(kv_tokens, req)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
+            h2d_preload_pages=h2d_preload_pages,
         )
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)

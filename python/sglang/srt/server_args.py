@@ -3484,6 +3484,15 @@ class ServerArgs:
             )
 
         if (
+            self.hicache_io_backend == "hybrid"
+            and self.hicache_mem_layout != "page_first_direct"
+        ):
+            self.hicache_mem_layout = "page_first_direct"
+            logger.warning(
+                "Hybrid io backend only supports page first direct layout, switching to page first direct layout"
+            )
+
+        if (
             self.hicache_mem_layout == "page_first"
             and self.hicache_io_backend == "direct"
         ):
@@ -3499,7 +3508,7 @@ class ServerArgs:
         ):
             return
 
-        if self.hicache_io_backend == "direct":
+        if self.hicache_io_backend in ("direct", "hybrid"):
             new_layout = "page_first_direct"
         elif self.hicache_io_backend == "kernel":
             new_layout = "page_first"
@@ -6253,7 +6262,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "hybrid"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )

@@ -107,11 +107,13 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        h2d_preload_pages: int = 0,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.h2d_preload_pages = h2d_preload_pages
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -132,6 +134,11 @@ class CacheOperation:
             node_ids.extend(op.node_ids)
         merged_op = CacheOperation(host_indices, device_indices, -1, priority)
         merged_op.node_ids = node_ids
+        # Merged operations are used only when the same transfer policy applies to
+        # every token. Hybrid H2D keeps operations separate until after the
+        # preload/tail split because each request can have a different preload
+        # length.
+        merged_op.h2d_preload_pages = sum(op.h2d_preload_pages for op in ops)
         return merged_op
 
     def __lt__(self, other: CacheOperation):
@@ -720,15 +727,18 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            write_io_backend = (
+                "direct" if self.io_backend == "hybrid" else self.io_backend
+            )
             self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+                self.mem_pool_device, host_indices, device_indices, write_io_backend
             )
             if self.has_draft:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
                     device_indices,
-                    self.io_backend,
+                    write_io_backend,
                 )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
@@ -746,15 +756,25 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[list] = None,
+        h2d_preload_pages: int = 0,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
         """
+        if extra_pools:
+            raise ValueError("extra_pools are only supported by HybridCacheController")
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
         self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                h2d_preload_pages=h2d_preload_pages,
+            )
         )
         return device_indices
 
@@ -764,7 +784,7 @@ class HiCacheController:
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
-        elif self.io_backend == "direct":
+        elif self.io_backend in ("direct", "hybrid"):
             if self.mem_pool_host.layout == "layer_first":
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
@@ -780,45 +800,125 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _split_hybrid_load_ops(self, ops: List[CacheOperation]):
+        preload_host_indices = []
+        preload_device_indices = []
+        tail_host_indices = []
+        tail_device_indices = []
+
+        for op in ops:
+            preload_tokens = min(
+                max(op.h2d_preload_pages, 0) * self.page_size,
+                len(op.host_indices),
+            )
+            if preload_tokens > 0:
+                preload_host_indices.append(op.host_indices[:preload_tokens])
+                preload_device_indices.append(op.device_indices[:preload_tokens])
+            if preload_tokens < len(op.host_indices):
+                tail_host_indices.append(op.host_indices[preload_tokens:])
+                tail_device_indices.append(op.device_indices[preload_tokens:])
+
+        def _cat(parts):
+            return torch.cat(parts) if parts else None
+
+        return (
+            _cat(preload_host_indices),
+            _cat(preload_device_indices),
+            _cat(tail_host_indices),
+            _cat(tail_device_indices),
+        )
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        ops = list(self.load_queue)
+        op = CacheOperation.merge_ops(ops)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
+            if self.io_backend == "hybrid":
+                (
+                    preload_host_indices,
+                    preload_device_indices,
+                    tail_host_indices,
+                    tail_device_indices,
+                ) = self._split_hybrid_load_ops(ops)
+
+                if preload_host_indices is not None:
+                    kernel_host_indices = preload_host_indices.to(
+                        self.device, non_blocking=True
+                    )
+                    for i in range(self.layer_num):
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            kernel_host_indices,
+                            preload_device_indices,
+                            i,
+                            "kernel",
+                        )
+                        if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                            self.mem_pool_host_draft.load_to_device_per_layer(
+                                self.mem_pool_device_draft,
+                                kernel_host_indices,
+                                preload_device_indices,
+                                i,
+                                "kernel",
+                            )
+                        if tail_host_indices is None:
+                            producer_event.complete(i)
+                    kernel_host_indices.record_stream(self.load_stream)
+                    if preload_device_indices.is_cuda:
+                        preload_device_indices.record_stream(self.load_stream)
+
+                if tail_host_indices is not None:
+                    tail_device_indices = tail_device_indices.cpu()
+                    for i in range(self.layer_num):
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            tail_host_indices,
+                            tail_device_indices,
+                            i,
+                            "direct",
+                        )
+                        if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                            self.mem_pool_host_draft.load_to_device_per_layer(
+                                self.mem_pool_device_draft,
+                                tail_host_indices,
+                                tail_device_indices,
+                                i,
+                                "direct",
+                            )
+                        producer_event.complete(i)
+            else:
+                host_indices, device_indices = self.move_indices(
+                    op.host_indices, op.device_indices
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
                         host_indices,
                         device_indices,
                         i,
                         self.io_backend,
                     )
-                producer_event.complete(i)
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+                    if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
+                    producer_event.complete(i)
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.load_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(

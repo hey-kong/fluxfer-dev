@@ -171,6 +171,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_mla", torch::kCUDA, &transfer_kv_per_layer_mla);
   m.def(
+      "transfer_kv_per_layer_mla_pfd_lf(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int layer_id, "
+      "int item_size, int src_layout_dim, int page_size, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_mla_pfd_lf", torch::kCUDA, &transfer_kv_per_layer_mla_pfd_lf);
+  m.def(
       "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int layer_id, "
       "int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kCUDA, &transfer_kv_per_layer_mla_pf_lf);
@@ -199,6 +203,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int page_size, int "
       "head_num, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_lf_ph", torch::kCUDA, &transfer_kv_all_layer_lf_ph);
+  m.def(
+      "transfer_kv_per_layer_pfd_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+      "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int block_quota, int "
+      "num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_pfd_lf", torch::kCUDA, &transfer_kv_per_layer_pfd_lf);
   m.def(
       "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
       "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int head_num, int block_quota, int "
