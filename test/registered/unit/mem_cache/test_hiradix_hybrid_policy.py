@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 
@@ -55,6 +56,79 @@ class TestHiRadixHybridWriteThroughPolicy(unittest.TestCase):
 
         self.assertIsNone(node.value)
         self.assertIsNotNone(node.host_value)
+
+    def _attach_child(self, parent: TreeNode, child: TreeNode, page_size: int) -> None:
+        child.parent = parent
+        parent.children[child.key.child_key(page_size)] = child
+
+    def _eviction_order(self, io_backend: str) -> list[str]:
+        page_size = 1
+        cache = object.__new__(HiRadixCache)
+        cache.page_size = page_size
+        cache.cache_controller = SimpleNamespace(
+            io_backend=io_backend,
+            write_policy="write_through",
+            evict_device=lambda value: len(value),
+        )
+        cache.root_node = TreeNode()
+        cache.root_node.key = RadixKey([])
+        cache.root_node.value = []
+        cache.root_node.lock_ref = 1
+        cache.root_node.children = {}
+        cache.evictable_size_ = 3
+        cache.evictable_leaves = set()
+        cache.evictable_host_leaves = set()
+
+        parent = self._node(1, page_size)
+        child = self._node(1, page_size)
+        sibling = self._node(1, page_size)
+        parent.key = RadixKey([1])
+        child.key = RadixKey([2])
+        sibling.key = RadixKey([3])
+        parent.priority = -100
+        child.priority = 0
+        sibling.priority = 10
+        parent.children = {}
+        child.children = {}
+        sibling.children = {}
+        for node in (parent, child, sibling):
+            node.host_value = node.value.clone()
+
+        self._attach_child(cache.root_node, parent, page_size)
+        self._attach_child(parent, child, page_size)
+        self._attach_child(cache.root_node, sibling, page_size)
+        cache.evictable_leaves.update([child, sibling])
+
+        class Strategy:
+            def get_priority(self, node):
+                return node.priority
+
+        cache.eviction_strategy = Strategy()
+        node_names = {parent.id: "parent", child.id: "child", sibling.id: "sibling"}
+        eviction_order = []
+        cache._record_remove_event = lambda node, medium=None: eviction_order.append(
+            node_names[node.id]
+        )
+        cache.update_eviction_metrics = lambda num_evicted, start_time: None
+
+        result = cache.evict(EvictParams(num_tokens=3))
+
+        self.assertEqual(result.num_tokens_evicted, 3)
+        return eviction_order
+
+    def test_hybrid_write_through_recollects_new_hbm_leaves_after_heap_drains(self):
+        eviction_order = self._eviction_order(io_backend="hybrid")
+
+        # The parent gets the best priority after its child is demoted, but hybrid
+        # write-through keeps processing the initial HBM leaf snapshot first.
+        self.assertEqual(eviction_order, ["child", "sibling", "parent"])
+
+    def test_non_hybrid_write_through_keeps_immediate_parent_heap_push(self):
+        eviction_order = self._eviction_order(io_backend="direct")
+
+        # Non-hybrid HBM eviction retains the previous behavior: the parent is
+        # immediately pushed and can preempt the remaining initial leaves.
+        self.assertEqual(eviction_order, ["child", "parent", "sibling"])
 
 
 if __name__ == "__main__":
