@@ -170,6 +170,11 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # Hybrid I/O + write-through keeps DRAM as the complete L2 and
+        # aggressively demotes selected device-resident nodes back to DRAM-only.
+        self.hybrid_pending_device_demotions = set()
+        self.hybrid_write_demote_node_ids = set()
+        self.hybrid_load_back_nodes_by_reqid: dict[str, list[TreeNode]] = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -293,6 +298,13 @@ class HiRadixCache(RadixCache):
                     f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
                     f"Expected one of {allowed}.",
                 )
+
+        if self.cache_controller.io_backend == "hybrid":
+            return (
+                False,
+                "Hybrid HiCache io backend only supports HBM and DRAM tiers; "
+                "runtime storage backend attach is not supported.",
+            )
 
         # If already enabled:
         # - backend unchanged: treat as success, update policies only.
@@ -630,6 +642,9 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.hybrid_pending_device_demotions.clear()
+        self.hybrid_write_demote_node_ids.clear()
+        self.hybrid_load_back_nodes_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -658,6 +673,98 @@ class HiRadixCache(RadixCache):
         if isinstance(self.cache_controller, HybridCacheController):
             return {"host_pools": self.cache_controller.mem_pool_host.entries}
         return {}
+
+    def _is_hybrid_write_through_mode(self) -> bool:
+        return (
+            self.cache_controller.io_backend == "hybrid"
+            and self.cache_controller.write_policy == "write_through"
+        )
+
+    def _try_hybrid_demote_device_node(self, node: TreeNode) -> bool:
+        if not self._is_hybrid_write_through_mode():
+            return False
+        if node is self.root_node or node.evicted or not node.backuped:
+            return False
+        if node.lock_ref > 0:
+            self.hybrid_pending_device_demotions.add(node)
+            return False
+
+        self.hybrid_pending_device_demotions.discard(node)
+        self._evict_backuped(node)
+        return True
+
+    def _drain_hybrid_pending_demotions(self) -> None:
+        if not self._is_hybrid_write_through_mode():
+            self.hybrid_pending_device_demotions.clear()
+            return
+
+        for node in list(self.hybrid_pending_device_demotions):
+            self._try_hybrid_demote_device_node(node)
+
+    def _select_hybrid_load_back_tail_nodes(
+        self, nodes: List[TreeNode]
+    ) -> List[TreeNode]:
+        total_pages = sum(len(node.value) // self.page_size for node in nodes)
+        keep_pages = (total_pages + 1) // 2
+        tail_nodes = []
+        page_offset = 0
+        for node in nodes:
+            node_pages = len(node.value) // self.page_size
+            node_start = page_offset
+            node_end = page_offset + node_pages
+            if keep_pages <= node_start and node_end <= total_pages:
+                tail_nodes.append(node)
+            page_offset = node_end
+        return tail_nodes
+
+    def _mark_hybrid_generated_node_for_demotion(self, node: TreeNode) -> None:
+        if not self._is_hybrid_write_through_mode():
+            return
+        if node.backuped:
+            # Recomputed/restored pages already have a DRAM copy.  Do not rewrite
+            # them; just demote them after the request releases its locks so the
+            # final generated-page state is DRAM-only.
+            self.hybrid_pending_device_demotions.add(node)
+        else:
+            # Fresh pages are demoted only after their write-through DMA ACKs.
+            node.hicache_demote_after_write = True
+
+    def _record_hybrid_load_back_nodes(
+        self, req, nodes_to_load: List[TreeNode]
+    ) -> None:
+        if (
+            req is None
+            or not self._is_hybrid_write_through_mode()
+            or len(nodes_to_load) == 0
+        ):
+            return
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            return
+        self.hybrid_load_back_nodes_by_reqid.setdefault(rid, []).extend(nodes_to_load)
+
+    def _demote_hybrid_load_back_tail_for_req(self, req) -> None:
+        if req is None:
+            return
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            return
+        nodes = self.hybrid_load_back_nodes_by_reqid.pop(rid, [])
+        if not nodes:
+            return
+        seen = set()
+        ordered_nodes = []
+        for node in nodes:
+            if node not in seen and not node.evicted:
+                ordered_nodes.append(node)
+                seen.add(node)
+        for node in self._select_hybrid_load_back_tail_nodes(ordered_nodes):
+            self._try_hybrid_demote_device_node(node)
+
+    def cache_finished_req(self, req, is_insert: bool = True):
+        super().cache_finished_req(req, is_insert=is_insert)
+        self._demote_hybrid_load_back_tail_for_req(req)
+        self._drain_hybrid_pending_demotions()
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
@@ -706,6 +813,11 @@ class HiRadixCache(RadixCache):
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
+            if self._is_hybrid_write_through_mode() and getattr(
+                node, "hicache_demote_after_write", False
+            ):
+                self.hybrid_write_demote_node_ids.add(node.id)
+                node.hicache_demote_after_write = False
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
@@ -758,6 +870,9 @@ class HiRadixCache(RadixCache):
                         )
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
+                        if backuped_node.id in self.hybrid_write_demote_node_ids:
+                            self.hybrid_write_demote_node_ids.discard(backuped_node.id)
+                            self._try_hybrid_demote_device_node(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -786,6 +901,9 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
+                if backuped_node.id in self.hybrid_write_demote_node_ids:
+                    self.hybrid_write_demote_node_ids.discard(backuped_node.id)
+                    self._try_hybrid_demote_device_node(backuped_node)
             finish_count -= 1
 
     def loading_check(self):
@@ -799,6 +917,7 @@ class HiRadixCache(RadixCache):
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+                self._drain_hybrid_pending_demotions()
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
@@ -972,7 +1091,7 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
 
         start_time = time.perf_counter()
@@ -1025,6 +1144,7 @@ class HiRadixCache(RadixCache):
             return None
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self._record_hybrid_load_back_nodes(req, nodes_to_load)
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
@@ -1050,7 +1170,7 @@ class HiRadixCache(RadixCache):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+            loading_values = self.load_back(last_node, mem_quota, req=params.req)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
@@ -1369,11 +1489,13 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
                     value.append(new_node.value)
+                    self._inc_hit_count(new_node)
                 node = new_node
                 break
             else:
                 if not child.evicted:
                     value.append(child.value)
+                    self._inc_hit_count(child)
                 node = child
                 key = key[prefix_len:]
 
@@ -1447,6 +1569,9 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
+                    self._mark_hybrid_generated_node_for_demotion(node)
+                    if self.cache_controller.write_policy != "write_back":
+                        self._inc_hit_count(node, chunked)
                 else:
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
@@ -1462,6 +1587,9 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
+                    self._mark_hybrid_generated_node_for_demotion(new_node)
+                    if self.cache_controller.write_policy != "write_back":
+                        self._inc_hit_count(new_node, chunked)
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
@@ -1491,6 +1619,7 @@ class HiRadixCache(RadixCache):
             self._record_store_event(new_node)
 
             if self.cache_controller.write_policy != "write_back":
+                self._mark_hybrid_generated_node_for_demotion(new_node)
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
 
@@ -1498,6 +1627,7 @@ class HiRadixCache(RadixCache):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
+        self.hybrid_load_back_nodes_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 
