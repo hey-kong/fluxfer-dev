@@ -45,8 +45,15 @@ class CacheOperation(BaseCacheOperation):
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        h2d_preload_pages: int = 0,
     ):
-        super().__init__(host_indices, device_indices, node_id, priority)
+        super().__init__(
+            host_indices,
+            device_indices,
+            node_id,
+            priority,
+            h2d_preload_pages=h2d_preload_pages,
+        )
         self.pool_transfers = pool_transfers
 
     @staticmethod
@@ -295,7 +302,13 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        h2d_preload_pages: int = 0,
     ) -> Optional[torch.Tensor]:
+        if h2d_preload_pages:
+            raise ValueError(
+                "Hybrid H2D preload is only supported by HiCacheController"
+            )
+
         need_load_kv = host_indices.numel() > 0
 
         full_allocator = getattr(

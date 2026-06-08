@@ -56,7 +56,9 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
+        transfer_kv_per_layer_mla_pfd_lf,
         transfer_kv_per_layer_pf_lf,
+        transfer_kv_per_layer_pfd_lf,
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
@@ -424,6 +426,19 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
                     )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_pfd_lf(
+                    src_k=self.k_buffer,
+                    dst_k=device_pool.k_buffer[layer_id],
+                    src_v=self.v_buffer,
+                    dst_v=device_pool.v_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim * self.page_size,
+                    page_size=self.page_size,
+                )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     # Transpose [page, layer, ...] -> [layer, page, ...] then
@@ -943,6 +958,17 @@ class MLATokenToKVPoolHost(HostKVCache):
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
                     )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_mla_pfd_lf(
+                    src=self.kv_buffer,
+                    dst=device_pool.kv_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim * self.page_size,
+                    page_size=self.page_size,
+                )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
