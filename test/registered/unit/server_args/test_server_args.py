@@ -457,6 +457,16 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                 )
 
+    def test_hybrid_hicache_rejects_storage_backend(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_io_backend="hybrid",
+            hicache_storage_backend="mooncake",
+        )
+
+        with self.assertRaisesRegex(ValueError, "only supports HBM and DRAM tiers"):
+            args._handle_hicache()
+
     @patch.object(ServerArgs, "use_mla_backend", return_value=False)
     @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
     def test_decode_attention_backend_with_implicit_fa3(

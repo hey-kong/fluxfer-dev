@@ -3493,6 +3493,15 @@ class ServerArgs:
             )
 
         if (
+            self.hicache_io_backend == "hybrid"
+            and self.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "Hybrid HiCache io backend only supports HBM and DRAM tiers; "
+                "disable --hicache-storage-backend when using --hicache-io-backend=hybrid."
+            )
+
+        if (
             self.hicache_mem_layout == "page_first"
             and self.hicache_io_backend == "direct"
         ):
