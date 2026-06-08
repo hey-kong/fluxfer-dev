@@ -993,10 +993,30 @@ class HiRadixCache(RadixCache):
 
         num_evicted = 0
         write_back_nodes = []
-        while num_evicted < num_tokens and len(eviction_heap):
+        defer_parent_refill = self._is_hybrid_write_through_mode()
+        evicted_at_heap_build = num_evicted
+        while num_evicted < num_tokens:
+            if not eviction_heap:
+                if not defer_parent_refill or num_evicted == evicted_at_heap_build:
+                    break
+
+                leaves = list(self.evictable_leaves)
+                if not leaves:
+                    break
+                eviction_heap = [
+                    (self.eviction_strategy.get_priority(node), node) for node in leaves
+                ]
+                heapq.heapify(eviction_heap)
+                evicted_at_heap_build = num_evicted
+
             _priority, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
+                self._update_leaf_status(x)
+                continue
+
+            if x.evicted:
+                self._update_leaf_status(x)
                 continue
 
             if not x.backuped:
@@ -1010,6 +1030,9 @@ class HiRadixCache(RadixCache):
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
+
+            if defer_parent_refill:
+                continue
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
