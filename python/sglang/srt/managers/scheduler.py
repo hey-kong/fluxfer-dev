@@ -21,7 +21,7 @@ import sys
 import time
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -188,6 +188,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -257,6 +258,32 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+
+# Balanced Batch Formation for HiCache hybrid I/O.  The ratio mirrors the
+# hybrid H2D preload heuristic in unified_radix_cache.py: up to eight host
+# cached tokens should be paired with each token of prefill compute.
+HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 8.0
+# Soft starvation escape hatch: old requests may bypass the ratio guard so
+# loading-heavy requests are not postponed indefinitely under compute-heavy load.
+HICACHE_HYBRID_BBF_STARVATION_SECONDS = 1.0
+
+
+@dataclass
+class HybridBalancedPrefillEstimate:
+    load_segments: List[Tuple[Any, int]]
+    extra_load_tokens: int
+    compute_tokens: int
+
+
+@dataclass
+class HybridBalancedPrefillState:
+    load_tokens: int = 0
+    compute_tokens: int = 0
+    loaded_segment_ids: set[Any] = field(default_factory=set)
+
+    @property
+    def ratio(self) -> float:
+        return self.load_tokens / max(self.compute_tokens, 1)
 
 
 @dataclass
@@ -1142,6 +1169,344 @@ class Scheduler(
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
                     device=self.tp_group.device,
                 )
+
+    def _is_hybrid_balanced_prefill_enabled(self) -> bool:
+        if not self.enable_hierarchical_cache:
+            return False
+        if not getattr(self.server_args, "enable_hybrid_balanced_batch", False):
+            return False
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        return getattr(cache_controller, "io_backend", None) == "hybrid"
+
+    def _is_hybrid_bubble_filling_enabled(self) -> bool:
+        if not self.enable_hierarchical_cache:
+            return False
+        if not getattr(self.server_args, "enable_hybrid_bubble_filling", False):
+            return False
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        return getattr(cache_controller, "io_backend", None) == "hybrid"
+
+    def _hybrid_prefill_load_queue_has_preload_pages(self) -> bool:
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        for op in getattr(cache_controller, "load_queue", ()):
+            if getattr(op, "h2d_preload_pages", 0) > 0:
+                return True
+        return False
+
+    def _hybrid_prefill_loading_finished(self, batch: ScheduleBatch) -> bool:
+        consumer_index = getattr(batch, "hicache_consumer_index", -1)
+        if consumer_index < 0:
+            return True
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        layer_done_counter = getattr(cache_controller, "layer_done_counter", None)
+        if layer_done_counter is None:
+            return True
+        try:
+            return layer_done_counter.events[consumer_index].finish_event.query()
+        except (AttributeError, IndexError):
+            # Be conservative if the counter cannot be inspected: run the
+            # prefill and let the model worker perform the normal per-layer wait.
+            return True
+
+    def _should_hybrid_bubble_fill_prefill(self, batch: ScheduleBatch) -> bool:
+        return (
+            self._is_hybrid_bubble_filling_enabled()
+            and getattr(batch, "hybrid_bubble_needs_preload", False)
+            and not self._hybrid_prefill_loading_finished(batch)
+        )
+
+    def _get_decode_batch_for_hybrid_bubble_filling(self) -> Optional[ScheduleBatch]:
+        if self.running_batch.is_empty() or self.running_batch.is_prefill_only:
+            return None
+        self.running_batch = self.update_running_batch(self.running_batch)
+        return self.running_batch if not self.running_batch.is_empty() else None
+
+    @staticmethod
+    def _hybrid_bbf_node_device_value(node: Any):
+        value = getattr(node, "value", None)
+        if value is not None:
+            return value
+        component_data = getattr(node, "component_data", None)
+        if component_data is not None:
+            return component_data[BASE_COMPONENT_TYPE].value
+        return None
+
+    @staticmethod
+    def _hybrid_bbf_node_host_value(node: Any):
+        host_value = getattr(node, "host_value", None)
+        if host_value is not None:
+            return host_value
+        component_data = getattr(node, "component_data", None)
+        if component_data is not None:
+            return component_data[BASE_COMPONENT_TYPE].host_value
+        return None
+
+    def _hybrid_bbf_load_segments(self, req: Req) -> List[Tuple[Any, int]]:
+        """Return host-cache segments that this request may load into HBM.
+
+        We identify segments by radix-tree node id when available.  This is an
+        exact de-duplication key for pure KV HiRadixCache nodes and a
+        conservative approximation for unified caches: sidecar state may also be
+        loaded, but the BBF admission ratio intentionally uses KV token counts.
+        """
+        host_hit_length = max(int(getattr(req, "host_hit_length", 0) or 0), 0)
+        if host_hit_length == 0:
+            return []
+
+        node = getattr(req, "best_match_node", None)
+        stop_node = getattr(req, "last_node", None)
+        root_node = getattr(self.tree_cache, "root_node", None)
+        segments: List[Tuple[Any, int]] = []
+        remaining = host_hit_length
+
+        while (
+            node is not None
+            and node is not root_node
+            and node is not stop_node
+            and remaining > 0
+        ):
+            host_value = self._hybrid_bbf_node_host_value(node)
+            device_value = self._hybrid_bbf_node_device_value(node)
+            if host_value is not None and device_value is None:
+                seg_len = len(host_value)
+                if seg_len > 0:
+                    seg_id = (type(node).__name__, getattr(node, "id", id(node)))
+                    segments.append((seg_id, seg_len))
+                    remaining -= seg_len
+            node = getattr(node, "parent", None)
+
+        if segments:
+            segments.reverse()
+            return segments
+
+        # Fallback: if the cache implementation reports host hits but does not
+        # expose a node chain that we can inspect, keep the scheduler correct by
+        # charging the request independently.  This may under-detect bundle hits
+        # but avoids incorrectly grouping loading-heavy requests.
+        return [(("req-host-hit", getattr(req, "rid", id(req))), host_hit_length)]
+
+    def _hybrid_bbf_estimate_req(
+        self,
+        req: Req,
+        adder: PrefillAdder,
+        state: HybridBalancedPrefillState,
+    ) -> HybridBalancedPrefillEstimate:
+        load_segments = self._hybrid_bbf_load_segments(req)
+        extra_load_tokens = sum(
+            seg_len
+            for seg_id, seg_len in load_segments
+            if seg_id not in state.loaded_segment_ids
+        )
+        compute_tokens = max(
+            int(getattr(req, "extend_input_len", 0) or 0)
+            - int(getattr(req, "host_hit_length", 0) or 0),
+            0,
+        )
+        # If chunked prefill is active, the request may only compute the next
+        # chunk even though it can load the whole cached prefix.  Use that
+        # post-chunk compute upper bound for the BBF ratio estimate.
+        if adder.rem_chunk_tokens is not None:
+            compute_tokens = min(compute_tokens, max(int(adder.rem_chunk_tokens), 0))
+        return HybridBalancedPrefillEstimate(
+            load_segments=load_segments,
+            extra_load_tokens=extra_load_tokens,
+            compute_tokens=compute_tokens,
+        )
+
+    @staticmethod
+    def _hybrid_bbf_req_starved(req: Req) -> bool:
+        entry_time = getattr(req.time_stats, "wait_queue_entry_time", 0.0)
+        return (
+            entry_time > 0
+            and time.perf_counter() - entry_time
+            >= HICACHE_HYBRID_BBF_STARVATION_SECONDS
+        )
+
+    def _hybrid_bbf_should_admit(
+        self,
+        req: Req,
+        adder: PrefillAdder,
+        state: HybridBalancedPrefillState,
+        estimate: HybridBalancedPrefillEstimate,
+    ) -> bool:
+        if len(adder.can_run_list) == 0:
+            return True
+        if self._hybrid_bbf_req_starved(req):
+            return True
+        next_load = state.load_tokens + estimate.extra_load_tokens
+        next_compute = state.compute_tokens + estimate.compute_tokens
+        return (
+            next_load / max(next_compute, 1)
+            <= HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
+        )
+
+    @staticmethod
+    def _hybrid_bbf_commit_req(
+        state: HybridBalancedPrefillState,
+        estimate: HybridBalancedPrefillEstimate,
+        loaded_tokens: int,
+        compute_tokens: int,
+    ) -> None:
+        remaining_loaded = max(loaded_tokens, 0)
+        for seg_id, seg_len in estimate.load_segments:
+            if remaining_loaded <= 0:
+                break
+            if seg_id not in state.loaded_segment_ids:
+                charged = min(seg_len, remaining_loaded)
+                state.loaded_segment_ids.add(seg_id)
+                state.load_tokens += charged
+            remaining_loaded -= seg_len
+        state.compute_tokens += max(compute_tokens, 0)
+
+    def _form_hybrid_balanced_prefill_batch(
+        self,
+        adder: PrefillAdder,
+        running_loras: Optional[set],
+    ) -> None:
+        """Build a prefill batch that balances host KV loading and compute.
+
+        The first pass preserves FIFO fairness by scanning from the queue head,
+        admitting requests whose host-load / compute ratio stays under the
+        hybrid loading bound and deferring loading-heavy candidates.  Later
+        passes retry deferred requests in original order, first with the ratio
+        guard and finally as a soft fallback so no request is dropped or starved.
+        """
+        bbf_state = HybridBalancedPrefillState()
+        for existing_req in adder.can_run_list:
+            # A continuing chunked request may have been admitted before the
+            # waiting-queue scan.  Count its admitted suffix compute so later
+            # host-heavy requests can pair with it.
+            bbf_state.compute_tokens += max(int(existing_req.extend_input_len), 0)
+        deprioritized: List[Req] = []
+        remaining_deprioritized: List[Req] = []
+
+        def hard_stop_or_full(req: Req) -> bool:
+            running_bs = len(self.running_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                self.running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
+                ):
+                    return True
+            return False
+
+        def free_unadded_mamba_idx(req: Req) -> None:
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if (
+                not added
+                and req.mamba_pool_idx is not None
+                and not getattr(req, "session", None)
+            ):
+                self.tree_cache.req_to_token_pool.mamba_pool.free(
+                    req.mamba_pool_idx.unsqueeze(-1)
+                )
+                req.mamba_pool_idx = None
+
+        def try_admit(
+            req: Req,
+            *,
+            enforce_ratio: bool,
+            collect_deprioritized: bool,
+        ) -> str:
+            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                return "continue"
+
+            if hard_stop_or_full(req):
+                return "stop"
+
+            if self.enable_hicache_storage:
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # Skip staging requests that are still waiting for L3 prefetch.
+                    return "continue"
+                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                    req.rid
+                )
+
+            req.init_next_round_input(self.tree_cache)
+            estimate = self._hybrid_bbf_estimate_req(req, adder, bbf_state)
+            if enforce_ratio and not self._hybrid_bbf_should_admit(
+                req, adder, bbf_state, estimate
+            ):
+                # init_next_round_input may reserve auxiliary cache slots for
+                # some hybrid caches.  If the ratio gate defers the request
+                # before add_one_req takes ownership, release those reservations.
+                free_unadded_mamba_idx(req)
+                if collect_deprioritized:
+                    deprioritized.append(req)
+                return "deprioritized"
+
+            prefix_len_before = len(req.prefix_indices)
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
+
+            if self.enable_lora:
+                running_loras.add(req.lora_id)
+
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if added:
+                loaded_tokens = max(len(req.prefix_indices) - prefix_len_before, 0)
+                # After add_one_req, extend_input_len reflects the actual suffix
+                # admitted to this prefill batch (including chunk truncation).
+                self._hybrid_bbf_commit_req(
+                    bbf_state,
+                    estimate,
+                    loaded_tokens=loaded_tokens,
+                    compute_tokens=max(int(req.extend_input_len), 0),
+                )
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    # Set batch_is_full after making sure there are requests that can be served.
+                    self.running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                        not self.running_batch.is_empty()
+                    )
+                free_unadded_mamba_idx(req)
+                return "stop"
+            return "continue"
+
+        for req in self.waiting_queue:
+            status = try_admit(
+                req,
+                enforce_ratio=True,
+                collect_deprioritized=True,
+            )
+            if status == "stop":
+                return
+
+        # Retry deferred requests in FIFO order after compute-heavy requests may
+        # have lowered the aggregate ratio enough for them to fit cleanly.
+        for req in deprioritized:
+            status = try_admit(
+                req,
+                enforce_ratio=True,
+                collect_deprioritized=False,
+            )
+            if status == "stop":
+                return
+            if status == "deprioritized":
+                remaining_deprioritized.append(req)
+
+        # Soft fallback: fill remaining budget in original deferred order.  This
+        # can break the ratio, but only after all ratio-preserving options have
+        # been tried, which prevents starvation and preserves throughput.
+        for req in remaining_deprioritized:
+            status = try_admit(
+                req,
+                enforce_ratio=False,
+                collect_deprioritized=False,
+            )
+            if status == "stop":
+                return
 
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
@@ -2558,7 +2923,12 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
-        if self.dllm_config is not None:
+        pending_prefill_batch = getattr(
+            self, "hybrid_bubble_pending_prefill_batch", None
+        )
+        if pending_prefill_batch is not None:
+            new_batch = pending_prefill_batch
+        elif self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
@@ -2577,8 +2947,19 @@ class Scheduler(
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
-            # Run prefill first if possible
-            ret = new_batch
+            if self._should_hybrid_bubble_fill_prefill(new_batch):
+                decode_batch = self._get_decode_batch_for_hybrid_bubble_filling()
+                if decode_batch is not None:
+                    self.hybrid_bubble_pending_prefill_batch = new_batch
+                    ret = decode_batch
+                else:
+                    self.hybrid_bubble_pending_prefill_batch = None
+                    ret = new_batch
+            else:
+                if new_batch is pending_prefill_batch:
+                    self.hybrid_bubble_pending_prefill_batch = None
+                # Run prefill first if possible
+                ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
             if (
@@ -2716,71 +3097,85 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                continue
-
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
-
-            if self.running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+        # Get requests from the waiting queue to a new prefill batch.
+        if self._is_hybrid_balanced_prefill_enabled():
+            self._form_hybrid_balanced_prefill_batch(
+                adder, running_loras if self.enable_lora else None
+            )
+        else:
+            for req in self.waiting_queue:
+                if self.enable_lora and not self._can_schedule_lora_req(
+                    req, running_loras
                 ):
-                    break
-
-            if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
+
+                running_bs = len(self.running_batch.reqs)
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                    running_bs
+                ):
+                    self.running_batch.batch_is_full = True
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # In prefill mode, prealloc queue and transfer queue can also take memory,
+                    # so we need to check if the available size for the actual available size.
+                    if (
+                        len(adder.can_run_list)
+                        >= self.req_to_token_pool.available_size()
+                    ):
+                        self.running_batch.batch_is_full = True
+
+                if self.running_batch.batch_is_full:
+                    if (
+                        not self.enable_priority_preemption
+                        or not adder.preempt_to_schedule(req, self.server_args)
+                    ):
+                        break
+
+                if self.enable_hicache_storage:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        continue
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                        req.rid
+                    )
+
+                req.init_next_round_input(self.tree_cache)
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
                 )
 
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
-            )
+                if self.enable_lora:
+                    running_loras.add(req.lora_id)
 
-            if self.enable_lora:
-                running_loras.add(req.lora_id)
-
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
-                        self.running_batch.batch_is_full = len(
-                            adder.can_run_list
-                        ) > 0 or (not self.running_batch.is_empty())
-                    else:
-                        self.running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if (
-                    not added
-                    and req.mamba_pool_idx is not None
-                    and not getattr(req, "session", None)
-                ):
-                    self.tree_cache.req_to_token_pool.mamba_pool.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
+                if res != AddReqResult.CONTINUE:
+                    if res == AddReqResult.NO_TOKEN:
+                        if self.enable_hierarchical_cache:
+                            # Set batch_is_full after making sure there are requests that can be served
+                            self.running_batch.batch_is_full = len(
+                                adder.can_run_list
+                            ) > 0 or (not self.running_batch.is_empty())
+                        else:
+                            self.running_batch.batch_is_full = True
+                    # revert matched mamba idx to avoid memory leak, if req is not added.
+                    # Only free if the slot was freshly allocated in this batch (not
+                    # pre-existing from a session). Session-held slots have their own
+                    # lifecycle and freeing them here causes double-free.
+                    added = (
+                        len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                     )
-                    req.mamba_pool_idx = None
-                break
+                    if (
+                        not added
+                        and req.mamba_pool_idx is not None
+                        and not getattr(req, "session", None)
+                    ):
+                        self.tree_cache.req_to_token_pool.mamba_pool.free(
+                            req.mamba_pool_idx.unsqueeze(-1)
+                        )
+                        req.mamba_pool_idx = None
+                    break
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -2825,8 +3220,16 @@ class Scheduler(
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            hybrid_preload_pages_pending = (
+                self._is_hybrid_bubble_filling_enabled()
+                and self._hybrid_prefill_load_queue_has_preload_pages()
+            )
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
+            )
+            new_batch.hybrid_bubble_needs_preload = (
+                hybrid_preload_pages_pending
+                and new_batch.hicache_consumer_index >= 0
             )
 
         new_batch.prepare_for_extend()
