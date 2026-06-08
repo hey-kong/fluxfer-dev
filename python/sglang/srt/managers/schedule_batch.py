@@ -1511,6 +1511,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
+    # Whether hybrid HiCache started preload pages for this extend batch.
+    hybrid_bubble_needs_preload: bool = False
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None

@@ -467,6 +467,56 @@ class TestHiCacheArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only supports HBM and DRAM tiers"):
             args._handle_hicache()
 
+
+    def test_hybrid_balanced_batch_requires_hybrid_io_backend(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_hybrid_balanced_batch=True,
+            hicache_io_backend="direct",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "requires --hicache-io-backend=hybrid"
+        ):
+            args._handle_hicache()
+
+    def test_hybrid_balanced_batch_allowed_with_hybrid_io_backend(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_hybrid_balanced_batch=True,
+            hicache_io_backend="hybrid",
+        )
+
+        args._handle_hicache()
+
+        self.assertTrue(args.enable_hybrid_balanced_batch)
+        self.assertEqual(args.hicache_io_backend, "hybrid")
+
+
+    def test_hybrid_bubble_filling_requires_hybrid_io_backend(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_hybrid_bubble_filling=True,
+            hicache_io_backend="direct",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "requires --hicache-io-backend=hybrid"
+        ):
+            args._handle_hicache()
+
+    def test_hybrid_bubble_filling_allowed_with_hybrid_io_backend(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_hybrid_bubble_filling=True,
+            hicache_io_backend="hybrid",
+        )
+
+        args._handle_hicache()
+
+        self.assertTrue(args.enable_hybrid_bubble_filling)
+        self.assertEqual(args.hicache_io_backend, "hybrid")
+
     @patch.object(ServerArgs, "use_mla_backend", return_value=False)
     @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
     def test_decode_attention_backend_with_implicit_fa3(

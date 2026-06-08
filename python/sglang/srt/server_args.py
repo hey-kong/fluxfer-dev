@@ -664,6 +664,8 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
+    enable_hybrid_balanced_batch: bool = False
+    enable_hybrid_bubble_filling: bool = False
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
@@ -3448,10 +3450,11 @@ class ServerArgs:
         """Normalize hicache-related knobs into a valid runtime configuration.
 
         Resolution order:
-        1) Layout <-> I/O compatibility for direct conflicts.
-        2) Storage <-> layout compatibility (may rewrite layout).
-        3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
-        4) Re-run step (1) if step (3) changed I/O backend.
+        1) Hybrid Balanced Batch <-> I/O compatibility validation.
+        2) Layout <-> I/O compatibility for direct conflicts.
+        3) Storage <-> layout compatibility (may rewrite layout).
+        4) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
+        5) Re-run validation/layout checks if step (4) changed I/O backend.
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -3460,18 +3463,35 @@ class ServerArgs:
         ):
             return
 
-        # Step 1: Initial layout-io compatibility normalization.
+        # Step 1: Initial hybrid Balanced Batch / I/O compatibility validation.
+        self._resolve_hybrid_feature_io_compatibility()
+
+        # Step 2: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
 
-        # Step 2: Storage-layout normalization without changing io backend.
+        # Step 3: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: IO-decode backend compatibility (may change io backend).
+        # Step 4: IO-decode backend compatibility (may change io backend).
         io_changed = self._resolve_io_decode_attention_compatibility()
 
-        # Step 4: Re-normalize layout after io backend changes.
+        # Step 5: Re-normalize and re-validate after io backend changes.
         if io_changed:
+            self._resolve_hybrid_feature_io_compatibility()
             self._resolve_layout_io_compatibility()
+
+    def _resolve_hybrid_feature_io_compatibility(self):
+        if self.hicache_io_backend == "hybrid":
+            return
+
+        if self.enable_hybrid_balanced_batch:
+            raise ValueError(
+                "--enable-hybrid-balanced-batch requires --hicache-io-backend=hybrid."
+            )
+        if self.enable_hybrid_bubble_filling:
+            raise ValueError(
+                "--enable-hybrid-bubble-filling requires --hicache-io-backend=hybrid."
+            )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -4295,6 +4315,21 @@ class ServerArgs:
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if (
+            self.hicache_io_backend != "hybrid"
+            and (
+                self.enable_hybrid_balanced_batch
+                or self.enable_hybrid_bubble_filling
+            )
+        ):
+            if self.enable_hybrid_balanced_batch:
+                raise ValueError(
+                    "--enable-hybrid-balanced-batch requires --hicache-io-backend=hybrid."
+                )
+            raise ValueError(
+                "--enable-hybrid-bubble-filling requires --hicache-io-backend=hybrid."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -6274,6 +6309,18 @@ class ServerArgs:
             choices=["direct", "kernel", "kernel_ascend", "hybrid"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--enable-hybrid-balanced-batch",
+            action="store_true",
+            default=ServerArgs.enable_hybrid_balanced_batch,
+            help="Enable Balanced Batch Formation for hybrid HiCache prefill batches. Requires --hicache-io-backend=hybrid.",
+        )
+        parser.add_argument(
+            "--enable-hybrid-bubble-filling",
+            action="store_true",
+            default=ServerArgs.enable_hybrid_bubble_filling,
+            help="Enable decode bubble filling while hybrid HiCache prefill preload is still in flight. Requires --hicache-io-backend=hybrid.",
         )
         parser.add_argument(
             "--hicache-mem-layout",
