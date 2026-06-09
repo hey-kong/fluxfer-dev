@@ -1624,6 +1624,15 @@ class UnifiedRadixCache(BasePrefixCache):
         """Flush pending write-through acknowledgements."""
         self.writing_check()
 
+    def flush_hicache_events_on_idle(self) -> None:
+        """Drain HiCache async events before idle memory accounting."""
+        if self.ongoing_write_through and self.cache_controller.ack_write_queue:
+            self.writing_check(write_back=True)
+        else:
+            self.writing_check()
+        self.loading_check()
+        self._drain_hybrid_pending_demotions()
+
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.cache_controller is not None:
