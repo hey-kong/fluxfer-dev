@@ -553,6 +553,19 @@ class SchedulerRuntimeCheckerMixin:
         if not self.is_fully_idle():
             return
 
+        # HiCache write-through may still have DMA ACKs queued after the last
+        # request leaves running_batch.  Drain them before the idle pool check so
+        # quick-demoted pages are returned to the device allocator and no longer
+        # look like leaked, uncached HBM.
+        if getattr(self, "enable_hierarchical_cache", False):
+            flush_on_idle = getattr(
+                self.tree_cache, "flush_hicache_events_on_idle", None
+            )
+            if flush_on_idle is not None:
+                flush_on_idle()
+            else:
+                self.tree_cache.check_hicache_events()
+
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
