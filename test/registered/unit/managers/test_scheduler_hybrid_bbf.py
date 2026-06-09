@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_policy import AddReqResult  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
     HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO,
+    HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS,
     HybridBalancedPrefillState,
     Scheduler,
 )
@@ -116,6 +117,44 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         ]
         self.assertFalse(scheduler._hybrid_prefill_load_queue_has_preload_pages())
 
+    def test_preload_pages_disabled_for_small_final_compute_batch(self):
+        scheduler = self._scheduler(_Node(0))
+        scheduler.tree_cache.cache_controller.load_queue = [
+            SimpleNamespace(h2d_preload_pages=3),
+            SimpleNamespace(h2d_preload_pages=1),
+        ]
+        can_run_list = [
+            _req(extend_input_len=40),
+            _req(extend_input_len=HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS - 40),
+        ]
+
+        self.assertEqual(
+            scheduler._hybrid_prefill_batch_compute_tokens(can_run_list),
+            HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS,
+        )
+        self.assertFalse(scheduler._should_hybrid_prefill_preload_batch(can_run_list))
+        self.assertTrue(
+            scheduler._should_hybrid_prefill_preload_batch(
+                [
+                    _req(
+                        extend_input_len=HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS
+                        + 1
+                    )
+                ]
+            )
+        )
+
+        scheduler._disable_hybrid_prefill_preload_pages()
+
+        self.assertFalse(scheduler._hybrid_prefill_load_queue_has_preload_pages())
+        self.assertEqual(
+            [
+                op.h2d_preload_pages
+                for op in scheduler.tree_cache.cache_controller.load_queue
+            ],
+            [0, 0],
+        )
+
     def test_load_segments_use_host_node_ids_for_dedup(self):
         root = _Node(0)
         device = _Node(1, parent=root, host_len=4, on_device=True)
@@ -155,7 +194,7 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
 
         self.assertEqual(estimate.extra_load_tokens, 7)
         self.assertEqual(estimate.compute_tokens, 3)
-        self.assertLessEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 8.0)
+        self.assertEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 16.0)
 
     def test_balanced_prefill_prioritizes_bundle_hits_after_anchor(self):
         root = _Node(0)
@@ -237,7 +276,7 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
 
     def test_ratio_guard_rejects_loading_heavy_non_empty_batch(self):
         scheduler = self._scheduler(_Node(0))
-        state = HybridBalancedPrefillState(load_tokens=80, compute_tokens=10)
+        state = HybridBalancedPrefillState(load_tokens=160, compute_tokens=10)
         adder = SimpleNamespace(rem_chunk_tokens=None, can_run_list=[object()])
         estimate = SimpleNamespace(extra_load_tokens=1, compute_tokens=0)
         req = _req()

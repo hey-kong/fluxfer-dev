@@ -260,9 +260,12 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 
 # Balanced Batch Formation for HiCache hybrid I/O.  The ratio mirrors the
-# hybrid H2D preload heuristic in unified_radix_cache.py: up to eight host
+# hybrid H2D preload heuristic in unified_radix_cache.py: up to sixteen host
 # cached tokens should be paired with each token of prefill compute.
-HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 8.0
+HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 16.0
+# Hybrid H2D preload should only run when the final prefill batch has enough
+# compute to overlap with the preload phase.
+HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS = 100
 # Soft starvation escape hatch: old requests may bypass the ratio guard so
 # loading-heavy requests are not postponed indefinitely under compute-heavy load.
 HICACHE_HYBRID_BBF_STARVATION_SECONDS = 1.0
@@ -1211,6 +1214,25 @@ class Scheduler(
                 return True
         return False
 
+    def _disable_hybrid_prefill_preload_pages(self) -> None:
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        for op in getattr(cache_controller, "load_queue", ()):
+            op.h2d_preload_pages = 0
+
+    @staticmethod
+    def _hybrid_prefill_batch_compute_tokens(can_run_list: List[Req]) -> int:
+        return sum(
+            max(int(getattr(req, "extend_input_len", 0) or 0), 0)
+            for req in can_run_list
+        )
+
+    @classmethod
+    def _should_hybrid_prefill_preload_batch(cls, can_run_list: List[Req]) -> bool:
+        return (
+            cls._hybrid_prefill_batch_compute_tokens(can_run_list)
+            > HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS
+        )
+
     def _hybrid_prefill_loading_finished(self, batch: ScheduleBatch) -> bool:
         consumer_index = getattr(batch, "hicache_consumer_index", -1)
         if consumer_index < 0:
@@ -1422,8 +1444,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     return True
             return False
@@ -3273,6 +3296,8 @@ class Scheduler(
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            if not self._should_hybrid_prefill_preload_batch(can_run_list):
+                self._disable_hybrid_prefill_preload_pages()
             hybrid_preload_pages_pending = (
                 self._is_hybrid_bubble_filling_enabled()
                 and self._hybrid_prefill_load_queue_has_preload_pages()
