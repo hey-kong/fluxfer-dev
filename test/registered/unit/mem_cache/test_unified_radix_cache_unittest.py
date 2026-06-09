@@ -1456,6 +1456,34 @@ class UnifiedRadixCacheSuite:
         self.assertIn(node, tree.evictable_host_leaves)
         tree.sanity_check()
 
+    def test_hicache_hybrid_quick_demote_releases_backuped_node(self):
+        """Hybrid write-through quick demotion releases HBM but keeps DRAM copy."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        self._backup_node(tree, node)
+        tree.cache_controller.io_backend = "hybrid"
+
+        full_available = getattr(
+            allocator, "full_available_size", allocator.available_size
+        )
+        available_before = full_available()
+        self.assertTrue(tree._try_hybrid_demote_device_node(node))
+
+        self.assertEqual(full_available(), available_before + len(seq))
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        self.assertIsNone(node.component_data[ComponentType.FULL].value)
+        self.assertIsNotNone(node.component_data[ComponentType.FULL].host_value)
+        self.assertEqual(tree.full_evictable_size(), 0)
+        self.assertIn(node, tree.evictable_host_leaves)
+        tree.sanity_check()
+
     def test_hicache_match_through_evicted_node(self):
         """Match can traverse evicted (S3) nodes using host_value."""
         if self._skip_unsupported_hicache_test():
