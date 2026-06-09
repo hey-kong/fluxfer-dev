@@ -440,6 +440,14 @@ class HiMambaRadixCache(MambaRadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
+    def flush_hicache_events_on_idle(self) -> None:
+        """Drain HiCache async events before idle memory accounting."""
+        if self.ongoing_write_through and self.cache_controller.ack_write_queue:
+            self.writing_check(write_back=True)
+        else:
+            self.writing_check()
+        self.loading_check()
+
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
