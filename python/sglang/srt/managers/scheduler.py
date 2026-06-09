@@ -3811,14 +3811,21 @@ class Scheduler(
                 idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
-            # destructive operations like attach/detach/flush_cache.
+            # destructive operations like attach/detach/flush_cache and before
+            # the idle memory checker treats the scheduler as quiescent.
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
-                idle &= len(tc.ongoing_load_back) == 0
-                if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
-                    idle &= len(tc.ongoing_backup) == 0
+                has_inflight_hicache_ops = getattr(
+                    tc, "has_inflight_hicache_ops", None
+                )
+                if has_inflight_hicache_ops is not None:
+                    idle &= not has_inflight_hicache_ops()
+                else:
+                    idle &= len(tc.ongoing_write_through) == 0
+                    idle &= len(tc.ongoing_load_back) == 0
+                    if tc.enable_storage:
+                        idle &= len(tc.ongoing_prefetch) == 0
+                        idle &= len(tc.ongoing_backup) == 0
 
         return idle
 

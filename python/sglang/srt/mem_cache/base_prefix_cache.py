@@ -299,6 +299,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def has_inflight_hicache_ops(self) -> bool:
+        """Whether hierarchical cache still has queued/asynchronous operations."""
+        return False
+
     def take_events(self):
         return []
 

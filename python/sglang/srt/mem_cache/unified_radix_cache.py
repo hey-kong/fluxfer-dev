@@ -1497,6 +1497,34 @@ class UnifiedRadixCache(BasePrefixCache):
         self.writing_check()
         self.loading_check()
 
+    def has_inflight_hicache_ops(self) -> bool:
+        """Return whether HiCache still owns asynchronous transfer state.
+
+        The scheduler's idle memory checker expects every allocated device page
+        to be accounted for by the radix tree or by active requests. HiCache can
+        temporarily own pages in controller queues / CUDA ack queues while the
+        scheduler has no runnable batch, so these queues must also keep the
+        scheduler out of the fully-idle path.
+        """
+        if self.cache_controller is None:
+            return False
+
+        if self.ongoing_write_through or self.ongoing_load_back:
+            return True
+        if self.enable_storage and (self.ongoing_prefetch or self.ongoing_backup):
+            return True
+
+        cc = self.cache_controller
+        return any(
+            len(getattr(cc, queue_name, ())) > 0
+            for queue_name in (
+                "write_queue",
+                "load_queue",
+                "ack_write_queue",
+                "ack_load_queue",
+            )
+        )
+
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
         self.writing_check()
