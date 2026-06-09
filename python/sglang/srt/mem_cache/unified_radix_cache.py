@@ -276,6 +276,9 @@ class UnifiedRadixCache(BasePrefixCache):
             int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
         ] = {}
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.hybrid_pending_device_demotions: set[UnifiedTreeNode] = set()
+        self.hybrid_write_demote_node_ids: set[int] = set()
+        self.hybrid_load_back_nodes_by_reqid: dict[str, list[UnifiedTreeNode]] = {}
         self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
@@ -425,6 +428,107 @@ class UnifiedRadixCache(BasePrefixCache):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
+    def _is_hybrid_write_through_mode(self) -> bool:
+        return (
+            self.cache_controller is not None
+            and self.cache_controller.io_backend == "hybrid"
+            and self.cache_controller.write_policy == "write_through"
+        )
+
+    def _try_hybrid_demote_device_node(self, node: UnifiedTreeNode) -> bool:
+        """Demote one device-resident node to host in hybrid write-through mode.
+
+        Quick demotion keeps the radix entry and its host copy, but releases HBM
+        as soon as no request/async DMA lock protects the node.
+        """
+        if not self._is_hybrid_write_through_mode():
+            return False
+        if node is self.root_node or node.evicted or not node.backuped:
+            return False
+        if any(cd.lock_ref > 0 for cd in node.component_data):
+            self.hybrid_pending_device_demotions.add(node)
+            return False
+
+        self.hybrid_pending_device_demotions.discard(node)
+        self._evict_to_host(node)
+        return True
+
+    def _drain_hybrid_pending_demotions(self) -> None:
+        if not self._is_hybrid_write_through_mode():
+            self.hybrid_pending_device_demotions.clear()
+            self.hybrid_write_demote_node_ids.clear()
+            self.hybrid_load_back_nodes_by_reqid.clear()
+            return
+
+        for node in list(self.hybrid_pending_device_demotions):
+            self._try_hybrid_demote_device_node(node)
+
+    def _select_hybrid_load_back_tail_nodes(
+        self, nodes: list[UnifiedTreeNode]
+    ) -> list[UnifiedTreeNode]:
+        total_pages = sum(
+            len(node.component_data[BASE_COMPONENT_TYPE].value) // self.page_size
+            for node in nodes
+            if node.component_data[BASE_COMPONENT_TYPE].value is not None
+        )
+        keep_pages = (total_pages + 1) // 2
+        tail_nodes: list[UnifiedTreeNode] = []
+        page_offset = 0
+        for node in nodes:
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            if value is None:
+                continue
+            node_pages = len(value) // self.page_size
+            node_start = page_offset
+            node_end = page_offset + node_pages
+            if keep_pages <= node_start and node_end <= total_pages:
+                tail_nodes.append(node)
+            page_offset = node_end
+        return tail_nodes
+
+    def _mark_hybrid_generated_node_for_demotion(self, node: UnifiedTreeNode) -> None:
+        if not self._is_hybrid_write_through_mode():
+            return
+        if node.backuped:
+            # Recomputed/restored pages already have a DRAM copy.  Do not rewrite
+            # them; just demote them after request and async locks are released.
+            self.hybrid_pending_device_demotions.add(node)
+        else:
+            # Fresh pages are demoted only after their write-through DMA ACKs.
+            node.hicache_demote_after_write = True
+
+    def _record_hybrid_load_back_nodes(
+        self, req, nodes_to_load: list[UnifiedTreeNode]
+    ) -> None:
+        if (
+            req is None
+            or not self._is_hybrid_write_through_mode()
+            or len(nodes_to_load) == 0
+        ):
+            return
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            return
+        self.hybrid_load_back_nodes_by_reqid.setdefault(rid, []).extend(nodes_to_load)
+
+    def _demote_hybrid_load_back_tail_for_req(self, req) -> None:
+        if req is None:
+            return
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            return
+        nodes = self.hybrid_load_back_nodes_by_reqid.pop(rid, [])
+        if not nodes:
+            return
+        seen = set()
+        ordered_nodes: list[UnifiedTreeNode] = []
+        for node in nodes:
+            if node not in seen and not node.evicted:
+                ordered_nodes.append(node)
+                seen.add(node)
+        for node in self._select_hybrid_load_back_tail_nodes(ordered_nodes):
+            self._try_hybrid_demote_device_node(node)
+
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
@@ -495,6 +599,9 @@ class UnifiedRadixCache(BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        self._demote_hybrid_load_back_tail_for_req(req)
+        self._drain_hybrid_pending_demotions()
 
     def cache_unfinished_req(self, req: Req, chunked=False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -822,6 +929,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         total_prefix_len=total_prefix_length,
                         params=params,
                     )
+                self._mark_hybrid_generated_node_for_demotion(node)
             else:
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len
@@ -881,6 +989,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
             )
         if is_new_leaf:
+            self._mark_hybrid_generated_node_for_demotion(target_node)
             self._inc_hit_count(target_node, params.chunked)
         return result
 
@@ -1212,6 +1321,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
         self.ongoing_write_through[node.id] = (node, lock_params)
+        if self._is_hybrid_write_through_mode() and getattr(
+            node, "hicache_demote_after_write", False
+        ):
+            self.hybrid_write_demote_node_ids.add(node.id)
+            node.hicache_demote_after_write = False
         return len(host_indices)
 
     def _get_hybrid_h2d_preload_pages(self, host_tokens: int, req) -> int:
@@ -1316,6 +1430,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
+        self._record_hybrid_load_back_nodes(req, kv_xfer.nodes_to_load or [])
         self.ongoing_load_back[best_match_node.id] = (
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
@@ -1399,6 +1514,9 @@ class UnifiedRadixCache(BasePrefixCache):
                             node, params = entry
                             if params is not None:
                                 self.dec_lock_ref(node, params)
+                            if node.id in self.hybrid_write_demote_node_ids:
+                                self.hybrid_write_demote_node_ids.discard(node.id)
+                                self._try_hybrid_demote_device_node(node)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1426,7 +1544,11 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 node, params = self.ongoing_write_through.pop(ack_id)
-                self.dec_lock_ref(node, params)
+                if params is not None:
+                    self.dec_lock_ref(node, params)
+                if node.id in self.hybrid_write_demote_node_ids:
+                    self.hybrid_write_demote_node_ids.discard(node.id)
+                    self._try_hybrid_demote_device_node(node)
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -1442,6 +1564,7 @@ class UnifiedRadixCache(BasePrefixCache):
             for ack_id in ack_list:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
+                self._drain_hybrid_pending_demotions()
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----
