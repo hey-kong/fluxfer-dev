@@ -849,10 +849,13 @@ class HiCacheController:
                     tail_device_indices,
                 ) = self._split_hybrid_load_ops(ops)
 
+                kernel_host_indices = None
                 if preload_host_indices is not None:
                     kernel_host_indices = preload_host_indices.to(
                         self.device, non_blocking=True
                     )
+
+                if kernel_host_indices is not None:
                     for i in range(self.layer_num):
                         self.mem_pool_host.load_to_device_per_layer(
                             self.mem_pool_device,
