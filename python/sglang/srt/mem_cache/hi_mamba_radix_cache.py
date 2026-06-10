@@ -422,9 +422,19 @@ class HiMambaRadixCache(MambaRadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        self._drain_load_back_acks(blocking=False)
+
+    def _drain_load_back_acks(self, blocking: bool = False):
+        """Release load-back locks for completed H2D transfers.
+
+        Normal scheduler steps poll to preserve H2D/CPU overlap. Idle memory
+        checks need a stable allocator/cache view, so they use a blocking drain.
+        """
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
+            if blocking:
+                finish_event.synchronize()
+            elif not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
@@ -446,7 +456,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.writing_check(write_back=True)
         else:
             self.writing_check()
-        self.loading_check()
+        self._drain_load_back_acks(blocking=True)
 
     def check_hicache_events(self):
         self.writing_check()
