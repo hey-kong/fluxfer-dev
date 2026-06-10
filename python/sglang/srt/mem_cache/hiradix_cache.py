@@ -689,6 +689,15 @@ class HiRadixCache(RadixCache):
             self.hybrid_pending_device_demotions.add(node)
             return False
 
+        # Keep the device tier as a contiguous prefix of every radix path.
+        # Demoting an internal node while any child remains on HBM creates an
+        # evicted ancestor above a device-resident descendant; the normal lock
+        # accounting assumes that cannot happen and would subtract this node
+        # from evictable_size_ again on the next hit.
+        if any(not child.evicted for child in node.children.values()):
+            self.hybrid_pending_device_demotions.discard(node)
+            return False
+
         self.hybrid_pending_device_demotions.discard(node)
         self._evict_backuped(node)
         return True
@@ -973,7 +982,7 @@ class HiRadixCache(RadixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 

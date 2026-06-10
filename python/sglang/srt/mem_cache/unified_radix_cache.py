@@ -449,6 +449,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.hybrid_pending_device_demotions.add(node)
             return False
 
+        # Preserve the Full-KV device tier invariant: every device-resident
+        # descendant must have device-resident ancestors.  FullComponent's lock
+        # path explicitly relies on this contiguous device-on segment.
+        if any(
+            child.component_data[BASE_COMPONENT_TYPE].value is not None
+            for child in node.children.values()
+        ):
+            self.hybrid_pending_device_demotions.discard(node)
+            return False
+
         self.hybrid_pending_device_demotions.discard(node)
         self._evict_to_host(node)
         return True
