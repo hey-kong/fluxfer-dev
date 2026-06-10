@@ -449,6 +449,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.hybrid_pending_device_demotions.add(node)
             return False
 
+        # Preserve the Full-KV device tier invariant: every device-resident
+        # descendant must have device-resident ancestors.  FullComponent's lock
+        # path explicitly relies on this contiguous device-on segment.
+        if any(
+            child.component_data[BASE_COMPONENT_TYPE].value is not None
+            for child in node.children.values()
+        ):
+            self.hybrid_pending_device_demotions.discard(node)
+            return False
+
         self.hybrid_pending_device_demotions.discard(node)
         self._evict_to_host(node)
         return True
@@ -1553,12 +1563,26 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
+        self._drain_load_back_acks(blocking=False)
+
+    def _drain_load_back_acks(self, blocking: bool = False) -> None:
+        """Release load-back locks for completed H2D transfers.
+
+        Device slots are allocated and attached to radix nodes before the async
+        H2D copy finishes. During normal scheduling we only poll completed
+        transfers so CPU work can overlap with DMA. At idle, memory accounting
+        must observe a quiescent cache state, so callers can request a blocking
+        drain of all pending load-back acknowledgements.
+        """
         cc = self.cache_controller
         if cc is None or not self.ongoing_load_back:
             return
+
         finish_count = 0
         for _, finish_event, ack_list in cc.ack_load_queue:
-            if not finish_event.query():
+            if blocking:
+                finish_event.synchronize()
+            elif not finish_event.query():
                 break
             finish_count += 1
             for ack_id in ack_list:
@@ -1630,7 +1654,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.writing_check(write_back=True)
         else:
             self.writing_check()
-        self.loading_check()
+        self._drain_load_back_acks(blocking=True)
         self._drain_hybrid_pending_demotions()
 
     def ready_to_load_host_cache(self) -> int:

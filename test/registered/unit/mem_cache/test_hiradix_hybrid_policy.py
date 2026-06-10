@@ -6,6 +6,8 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 
 
 class TestHiRadixHybridWriteThroughPolicy(unittest.TestCase):
@@ -56,6 +58,68 @@ class TestHiRadixHybridWriteThroughPolicy(unittest.TestCase):
 
         self.assertIsNone(node.value)
         self.assertIsNotNone(node.host_value)
+
+    def test_quick_demotion_skips_internal_node_with_device_child(self):
+        page_size = 4
+        cache = object.__new__(HiRadixCache)
+        cache.cache_controller = SimpleNamespace(
+            io_backend="hybrid", write_policy="write_through"
+        )
+        cache.hybrid_pending_device_demotions = set()
+        cache.root_node = TreeNode()
+        cache.root_node.children = {}
+
+        parent = self._node(1, page_size)
+        parent.key = RadixKey([1])
+        parent.children = {}
+        parent.host_value = parent.value.clone()
+        child = self._node(1, page_size)
+        child.key = RadixKey([2])
+        child.children = {}
+        child.host_value = child.value.clone()
+        self._attach_child(cache.root_node, parent, page_size)
+        self._attach_child(parent, child, page_size)
+
+        evicted = []
+        cache._evict_backuped = lambda node: evicted.append(node)
+
+        self.assertFalse(cache._try_hybrid_demote_device_node(parent))
+        self.assertEqual(evicted, [])
+        self.assertIsNotNone(parent.value)
+        self.assertNotIn(parent, cache.hybrid_pending_device_demotions)
+
+    def test_unified_quick_demotion_skips_internal_node_with_device_child(self):
+        tree_components = (ComponentType.FULL,)
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = SimpleNamespace(
+            io_backend="hybrid", write_policy="write_through"
+        )
+        cache.hybrid_pending_device_demotions = set()
+        cache.root_node = UnifiedTreeNode(tree_components)
+        cache.root_node.children = {}
+
+        parent = UnifiedTreeNode(tree_components)
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1])
+        parent.children = {}
+        parent.component_data[ComponentType.FULL].value = torch.tensor([1])
+        parent.component_data[ComponentType.FULL].host_value = torch.tensor([1])
+        child = UnifiedTreeNode(tree_components)
+        child.parent = parent
+        child.key = RadixKey([2])
+        child.children = {}
+        child.component_data[ComponentType.FULL].value = torch.tensor([2])
+        child.component_data[ComponentType.FULL].host_value = torch.tensor([2])
+        cache.root_node.children[1] = parent
+        parent.children[2] = child
+
+        evicted = []
+        cache._evict_to_host = lambda node: evicted.append(node)
+
+        self.assertFalse(cache._try_hybrid_demote_device_node(parent))
+        self.assertEqual(evicted, [])
+        self.assertIsNotNone(parent.component_data[ComponentType.FULL].value)
+        self.assertNotIn(parent, cache.hybrid_pending_device_demotions)
 
     def _attach_child(self, parent: TreeNode, child: TreeNode, page_size: int) -> None:
         child.parent = parent

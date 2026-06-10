@@ -689,6 +689,15 @@ class HiRadixCache(RadixCache):
             self.hybrid_pending_device_demotions.add(node)
             return False
 
+        # Keep the device tier as a contiguous prefix of every radix path.
+        # Demoting an internal node while any child remains on HBM creates an
+        # evicted ancestor above a device-resident descendant; the normal lock
+        # accounting assumes that cannot happen and would subtract this node
+        # from evictable_size_ again on the next hit.
+        if any(not child.evicted for child in node.children.values()):
+            self.hybrid_pending_device_demotions.discard(node)
+            return False
+
         self.hybrid_pending_device_demotions.discard(node)
         self._evict_backuped(node)
         return True
@@ -907,9 +916,19 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        self._drain_load_back_acks(blocking=False)
+
+    def _drain_load_back_acks(self, blocking: bool = False):
+        """Release load-back locks for completed H2D transfers.
+
+        Normal scheduler steps poll to preserve H2D/CPU overlap. Idle memory
+        checks need a stable allocator/cache view, so they use a blocking drain.
+        """
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
+            if blocking:
+                finish_event.synchronize()
+            elif not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
@@ -963,7 +982,7 @@ class HiRadixCache(RadixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1224,7 +1243,7 @@ class HiRadixCache(RadixCache):
             self.writing_check(write_back=True)
         else:
             self.writing_check()
-        self.loading_check()
+        self._drain_load_back_acks(blocking=True)
         self._drain_hybrid_pending_demotions()
 
     def check_hicache_events(self):
