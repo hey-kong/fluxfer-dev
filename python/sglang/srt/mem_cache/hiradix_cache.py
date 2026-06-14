@@ -770,10 +770,137 @@ class HiRadixCache(RadixCache):
         for node in self._select_hybrid_load_back_tail_nodes(ordered_nodes):
             self._try_hybrid_demote_device_node(node)
 
+    def _hybrid_write_through_cache_len(self, req, token_len: int) -> int:
+        """Return the token prefix that may be cached in hybrid write-through.
+
+        HiCache pages are indivisible. If a page contains both prompt/prefill
+        tokens and decode-generated tokens, caching that page would keep decode
+        KV resident after request completion. Therefore, hybrid write-through
+        caches only full prompt pages and drops the mixed prompt/decode page
+        together with decode-only pages when the request finishes.
+        """
+        prompt_page_aligned_len = (
+            len(req.origin_input_ids) // self.page_size * self.page_size
+        )
+        return min(token_len, prompt_page_aligned_len)
+
     def cache_finished_req(self, req, is_insert: bool = True):
-        super().cache_finished_req(req, is_insert=is_insert)
+        if not self._is_hybrid_write_through_mode():
+            super().cache_finished_req(req, is_insert=is_insert)
+            self._demote_hybrid_load_back_tail_for_req(req)
+            self._drain_hybrid_pending_demotions()
+            return
+
+        # In hybrid write-through mode, only prompt/prefill pages are promoted
+        # into the radix cache and written through to DRAM.  Decode-generated
+        # pages stay request-owned and are freed when the request finishes.
+        if self.disable_finished_insert:
+            is_insert = False
+
+        kv_committed_len = req.pop_committed_kv_cache()
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            self._demote_hybrid_load_back_tail_for_req(req)
+            self._drain_hybrid_pending_demotions()
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        cache_len = self._hybrid_write_through_cache_len(req, len(token_ids))
+        radix_key = RadixKey(
+            token_ids[:cache_len], req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        key_len = len(radix_key)
+        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+
+        if is_insert and key_len > 0:
+            priority = getattr(req, "priority", 0) or 0
+            result = self.insert(
+                InsertParams(key=radix_key, value=values, priority=priority)
+            )
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : result.prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : key_len]
+            )
+
+        # Free unaligned prompt tails and every decode-generated KV slot.  Those
+        # slots were never inserted into the radix cache in hybrid write-through
+        # mode, so they must not remain cache-resident after request completion.
+        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
+
         self._demote_hybrid_load_back_tail_for_req(req)
         self._drain_hybrid_pending_demotions()
+
+    def cache_unfinished_req(self, req, chunked=False):
+        if not self._is_hybrid_write_through_mode():
+            return super().cache_unfinished_req(req, chunked=chunked)
+
+        if self.disable:
+            return
+
+        cache_len = self._hybrid_write_through_cache_len(req, len(req.fill_ids))
+        token_ids = req.fill_ids[:cache_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(req.fill_ids)
+        ]
+
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
+
+        result = self.insert(
+            InsertParams(
+                key=radix_key,
+                value=values,
+                chunked=chunked,
+                priority=getattr(req, "priority", 0) or 0,
+            )
+        )
+        new_prefix_len = result.prefix_len
+
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[req.cache_protected_len : new_prefix_len]
+        )
+
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        new_indices, new_last_node = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+        assert len(new_indices) == len(
+            radix_key
+        ), f"{len(new_indices)=}, {len(radix_key)=}"
+
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
+        )
+
+        req.cache_protected_len = len(new_indices)
+
+        self.dec_lock_ref(req.last_node)
+        self.inc_lock_ref(new_last_node)
+
+        if len(new_indices) < len(kv_indices):
+            req.prefix_indices = torch.cat(
+                [new_indices, kv_indices[len(new_indices) :]]
+            )
+        else:
+            req.prefix_indices = new_indices
+        req.last_node = new_last_node
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
