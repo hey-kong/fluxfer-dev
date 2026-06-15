@@ -423,6 +423,17 @@ class TestHiCacheArgs(unittest.TestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "hybrid_with_tp_gt_one",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_io_backend": "hybrid",
+                    "hicache_mem_layout": "page_first_direct",
+                    "tp_size": 2,
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "mooncake_with_layer_first",
                 "overrides": {
                     "enable_hierarchical_cache": True,
