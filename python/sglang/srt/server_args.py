@@ -3521,6 +3521,13 @@ class ServerArgs:
                 "disable --hicache-storage-backend when using --hicache-io-backend=hybrid."
             )
 
+        if self.hicache_io_backend == "hybrid" and self.tp_size > 1:
+            self.hicache_io_backend = "direct"
+            logger.warning(
+                "Hybrid HiCache io backend is optimized for single-TP page preloading; "
+                "switching to direct io backend when tp_size > 1"
+            )
+
         if (
             self.hicache_mem_layout == "page_first"
             and self.hicache_io_backend == "direct"
