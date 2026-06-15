@@ -849,34 +849,90 @@ class HiCacheController:
                     tail_device_indices,
                 ) = self._split_hybrid_load_ops(ops)
 
-                kernel_host_indices = None
                 if preload_host_indices is not None:
-                    kernel_host_indices = preload_host_indices.to(
-                        self.device, non_blocking=True
-                    )
-
-                if kernel_host_indices is not None:
-                    for i in range(self.layer_num):
-                        self.mem_pool_host.load_to_device_per_layer(
-                            self.mem_pool_device,
-                            kernel_host_indices,
-                            preload_device_indices,
-                            i,
-                            "kernel",
+                    staged = None
+                    staged_draft = None
+                    if hasattr(self.mem_pool_host, "stage_pages_to_device"):
+                        staged = self.mem_pool_host.stage_pages_to_device(
+                            preload_host_indices, self.device
                         )
-                        if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                            self.mem_pool_host_draft.load_to_device_per_layer(
-                                self.mem_pool_device_draft,
+                    if self.has_draft and hasattr(
+                        self.mem_pool_host_draft, "stage_pages_to_device"
+                    ):
+                        staged_draft = self.mem_pool_host_draft.stage_pages_to_device(
+                            preload_host_indices, self.device
+                        )
+
+                    if staged is not None:
+                        staged_k, staged_v, staged_indices = staged
+                        draft_staged_k = draft_staged_v = draft_staged_indices = None
+                        if staged_draft is not None:
+                            (
+                                draft_staged_k,
+                                draft_staged_v,
+                                draft_staged_indices,
+                            ) = staged_draft
+
+                        for i in range(self.layer_num):
+                            self.mem_pool_host.split_staged_pages_to_device_per_layer(
+                                self.mem_pool_device,
+                                staged_k,
+                                staged_v,
+                                staged_indices,
+                                preload_device_indices,
+                                i,
+                            )
+                            if (
+                                staged_draft is not None
+                                and i < self.mem_pool_host_draft.layer_num
+                            ):
+                                self.mem_pool_host_draft.split_staged_pages_to_device_per_layer(
+                                    self.mem_pool_device_draft,
+                                    draft_staged_k,
+                                    draft_staged_v,
+                                    draft_staged_indices,
+                                    preload_device_indices,
+                                    i,
+                                )
+                            if tail_host_indices is None:
+                                producer_event.complete(i)
+                        staged_k.record_stream(self.load_stream)
+                        staged_v.record_stream(self.load_stream)
+                        staged_indices.record_stream(self.load_stream)
+                        if staged_draft is not None:
+                            draft_staged_k.record_stream(self.load_stream)
+                            draft_staged_v.record_stream(self.load_stream)
+                            draft_staged_indices.record_stream(self.load_stream)
+                        if preload_device_indices.is_cuda:
+                            preload_device_indices.record_stream(self.load_stream)
+                    else:
+                        kernel_host_indices = preload_host_indices.to(
+                            self.device, non_blocking=True
+                        )
+                        for i in range(self.layer_num):
+                            self.mem_pool_host.load_to_device_per_layer(
+                                self.mem_pool_device,
                                 kernel_host_indices,
                                 preload_device_indices,
                                 i,
                                 "kernel",
                             )
-                        if tail_host_indices is None:
-                            producer_event.complete(i)
-                    kernel_host_indices.record_stream(self.load_stream)
-                    if preload_device_indices.is_cuda:
-                        preload_device_indices.record_stream(self.load_stream)
+                            if (
+                                self.has_draft
+                                and i < self.mem_pool_host_draft.layer_num
+                            ):
+                                self.mem_pool_host_draft.load_to_device_per_layer(
+                                    self.mem_pool_device_draft,
+                                    kernel_host_indices,
+                                    preload_device_indices,
+                                    i,
+                                    "kernel",
+                                )
+                            if tail_host_indices is None:
+                                producer_event.complete(i)
+                        kernel_host_indices.record_stream(self.load_stream)
+                        if preload_device_indices.is_cuda:
+                            preload_device_indices.record_stream(self.load_stream)
 
                 if tail_host_indices is not None:
                     tail_device_indices = tail_device_indices.cpu()

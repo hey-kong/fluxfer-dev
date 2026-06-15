@@ -396,6 +396,77 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def stage_pages_to_device(self, host_indices, device: str):
+        """DMA page-first-direct host pages into a compact GPU staging buffer.
+
+        The staging buffer keeps the host page-first-direct layout:
+        [page, layer, page_offset, head, dim].  A later lightweight split kernel
+        scatters each staged layer into the device layer-first KV pool.
+        """
+        if self.layout != "page_first_direct":
+            raise ValueError(
+                "Staged H2D preload is only supported for page_first_direct layout"
+            )
+        if host_indices.numel() == 0:
+            return None
+        if host_indices.numel() % self.page_size != 0:
+            raise ValueError(
+                "Staged H2D preload requires whole pages, "
+                f"got {host_indices.numel()} tokens with page_size={self.page_size}"
+            )
+
+        host_indices_cpu = host_indices.cpu()
+        page_ids = (host_indices_cpu[:: self.page_size] // self.page_size).tolist()
+        num_pages = len(page_ids)
+        staged_k = torch.empty(
+            (
+                num_pages,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=device,
+        )
+        staged_v = torch.empty_like(staged_k)
+        for dst_page, src_page in enumerate(page_ids):
+            staged_k[dst_page].copy_(self.k_buffer[src_page], non_blocking=True)
+            staged_v[dst_page].copy_(self.v_buffer[src_page], non_blocking=True)
+
+        staged_indices = torch.arange(
+            num_pages * self.page_size, dtype=torch.int64, device=device
+        )
+        return staged_k, staged_v, staged_indices
+
+    def split_staged_pages_to_device_per_layer(
+        self,
+        device_pool,
+        staged_k,
+        staged_v,
+        staged_indices,
+        device_indices,
+        layer_id,
+    ):
+        """Split staged page-first-direct pages into layer-first device KV cache.
+
+        Keep block_quota fixed to 1 so the split uses a single GPU block and
+        does not reserve many compute resources.
+        """
+        transfer_kv_per_layer_pfd_lf(
+            src_k=staged_k,
+            dst_k=device_pool.k_buffer[layer_id],
+            src_v=staged_v,
+            dst_v=device_pool.v_buffer[layer_id],
+            src_indices=staged_indices,
+            dst_indices=device_indices,
+            layer_id=layer_id,
+            item_size=self.token_stride_size,
+            src_layout_dim=self.layout_dim * self.page_size,
+            page_size=self.page_size,
+            block_quota=1,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
