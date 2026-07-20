@@ -194,7 +194,7 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
 
         self.assertEqual(estimate.extra_load_tokens, 7)
         self.assertEqual(estimate.compute_tokens, 3)
-        self.assertEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 10.0)
+        self.assertEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 4.0)
 
     def test_balanced_prefill_prioritizes_bundle_hits_after_anchor(self):
         root = _Node(0)

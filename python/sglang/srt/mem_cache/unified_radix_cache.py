@@ -1351,7 +1351,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if compute_tokens == 0:
             return total_pages
 
-        max_overlap_tokens = 10 * compute_tokens
+        max_overlap_tokens = 4 * compute_tokens
         if host_tokens <= max_overlap_tokens:
             return 0
 

@@ -260,9 +260,8 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 
 # Balanced Batch Formation for HiCache hybrid I/O.  The ratio mirrors the
-# hybrid H2D preload heuristic in unified_radix_cache.py: up to ten host
-# cached tokens should be paired with each token of prefill compute.
-HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 10.0
+# hybrid H2D preload heuristic in unified_radix_cache.py.
+HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 4.0
 # Hybrid H2D preload should only run when the final prefill batch has enough
 # compute to overlap with the preload phase.
 HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS = 100
