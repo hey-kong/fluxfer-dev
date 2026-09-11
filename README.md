@@ -1,91 +1,369 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# Fluxfer Artifact
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+Fluxfer is a transfer-aware and memory-efficient hierarchical prefix-caching
+system for LLM serving. This repository contains the
+modified SGLang engine, GPU kernels, workload traces, and the trace-replay
+client used to evaluate Fluxfer and the baselines reported in the paper.
 
-</div>
+This README describes how to:
 
---------------------------------------------------------------------------------
+1. build and launch Fluxfer;
+2. replay a workload trace and collect TTFT/TPOT metrics; and
+3. reproduce the corresponding vLLM and SGLang baselines.
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
+## Repository layout
 
-## News
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/10] 🔥 SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+The commands below assume the following repository layout:
 
-<details>
-<summary>More</summary>
+```text
+.
+├── python/             # Modified SGLang Python package
+├── sgl-kernel/         # Modified SGLang GPU kernels
+├── trace-replayer/     # Rust trace-replay client
+└── scaled_traces/      # Scaled traces used by the experiments
+```
 
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+All commands are executed from the repository root unless a command explicitly
+changes directory.
 
-</details>
+## Requirements
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+### Software
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+- Linux (x86-64)
+- Python 3.12
+- [uv](https://docs.astral.sh/uv/)
+- Rust and Cargo
+- A CUDA toolkit compatible with the PyTorch version installed by the artifact
+- A C/C++ compiler, CMake, Ninja, and standard Python build tools
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+Install `uv` if necessary:
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+Install Rust if necessary:
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "${CARGO_HOME:-$HOME/.cargo}/env"
+```
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+### Hardware and model
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+- One CUDA-capable NVIDIA GPU with enough memory to serve
+  `Llama-3.1-8B-Instruct`
+- At least 64 GiB of available host memory for the configured host KV cache,
+  plus additional memory for the model, runtime, replay client, and operating
+  system
+- Local access to the model weights and tokenizer files
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+The examples use `Llama-3.1-8B-Instruct`. Access to the model is governed by
+the model provider's license and is not included with this artifact.
+
+Before running an experiment, define the following paths:
+
+```bash
+export FLUXFER_ROOT="$(pwd)"
+export MODEL_PATH="/path/to/Llama-3.1-8B-Instruct"
+export TRACE_PATH="$FLUXFER_ROOT/scaled_traces/qwen_traceA_blksz_16.jsonl"
+export RESULTS_DIR="$FLUXFER_ROOT/results"
+mkdir -p "$RESULTS_DIR"
+```
+
+The model directory must contain at least:
+
+```text
+config.json
+tokenizer.json
+tokenizer_config.json
+```
+
+## Quick start: Fluxfer
+
+### 1. Create an isolated environment
+
+```bash
+cd "$FLUXFER_ROOT"
+uv venv --python 3.12 .venv-fluxfer
+source .venv-fluxfer/bin/activate
+```
+
+### 2. Install the modified SGLang engine
+
+```bash
+uv pip install -e "python"
+```
+
+Build the modified kernels:
+
+```bash
+cd "$FLUXFER_ROOT/sgl-kernel"
+make -f Makefile.uv build \
+  MAX_JOBS=32 \
+  CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+cd "$FLUXFER_ROOT"
+```
+
+### 3. Start Fluxfer
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 64 \
+  --page-size 16 \
+  --hicache-mem-layout page_first_direct \
+  --hicache-io-backend hybrid \
+  --enable-hybrid-balanced-batch \
+  --enable-hybrid-bubble-filling
+```
+
+The Fluxfer-specific settings are:
+
+| Argument | Value | Purpose |
+| --- | ---: | --- |
+| `--hicache-size` | `64` | Allocates a 64 GiB host-memory KV-cache pool. |
+| `--page-size` | `16` | Uses 16-token KV-cache pages. |
+| `--hicache-mem-layout` | `page_first_direct` | Enables the page-first host-memory layout used by Fluxfer. |
+| `--hicache-io-backend` | `hybrid` | Enables Fluxfer's hybrid page/direct transfer path. |
+| `--enable-hybrid-balanced-batch` | enabled | Enables transfer-aware balanced batch formation. |
+| `--enable-hybrid-bubble-filling` | enabled | Enables bubble-filling scheduling. |
+
+Wait until the server reports that it is ready. From another terminal, check
+the OpenAI-compatible endpoint:
+
+```bash
+curl --fail --silent http://localhost:30000/v1/models
+```
+
+If this command fails, inspect the server log before starting the replay.
+
+## Build the trace replayer
+
+The replay client is written in Rust. Build the optimized binary once:
+
+```bash
+cd "$FLUXFER_ROOT/trace-replayer"
+cargo build \
+  -p request-sim \
+  --bin client \
+  --release \
+  -j32
+cd "$FLUXFER_ROOT"
+```
+
+The executable is created at:
+
+```text
+trace-replayer/target/release/client
+```
+
+## Replay a trace
+
+With Fluxfer listening on `localhost:30000`, run:
+
+```bash
+"$FLUXFER_ROOT/trace-replayer/target/release/client" \
+  --tokenizer "$MODEL_PATH/tokenizer.json" \
+  --tokenizer-config "$MODEL_PATH/tokenizer_config.json" \
+  --endpoint http://localhost:30000/v1/chat/completions \
+  --api openai \
+  --dataset bailian \
+  --dataset-path "$TRACE_PATH" \
+  --output-path "$RESULTS_DIR/fluxfer_traceA" \
+  --scale-factor 1.0 \
+  --time-in-secs 7500 \
+  --model-name "$MODEL_PATH" \
+  --stream
+```
+
+After the replay completes, aggregate metrics, including time to first token
+(TTFT) and time per output token (TPOT), are written to:
+
+```text
+results/fluxfer_traceA.summary.json
+```
+
+## Baselines
+
+### vLLM + native KV offload
+
+Create an isolated environment and install the version used by the artifact:
+
+```bash
+cd "$FLUXFER_ROOT"
+uv venv --python 3.12 .venv-vllm-native
+source .venv-vllm-native/bin/activate
+uv pip install "vllm==0.23.0"
+```
+
+Start the server:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL_PATH" \
+  --port 8080 \
+  --enable-prefix-caching \
+  --block-size 16 \
+  --kv-offloading-backend native \
+  --kv-offloading-size 64 \
+  --disable-hybrid-kv-cache-manager
+```
+
+Replay the same trace:
+
+```bash
+"$FLUXFER_ROOT/trace-replayer/target/release/client" \
+  --tokenizer "$MODEL_PATH/tokenizer.json" \
+  --tokenizer-config "$MODEL_PATH/tokenizer_config.json" \
+  --endpoint http://localhost:8080/v1/chat/completions \
+  --api openai \
+  --dataset bailian \
+  --dataset-path "$TRACE_PATH" \
+  --output-path "$RESULTS_DIR/vllm_native_traceA" \
+  --scale-factor 1.0 \
+  --time-in-secs 7500 \
+  --model-name "$MODEL_PATH" \
+  --stream
+```
+
+### vLLM + LMCache
+
+Create a separate environment:
+
+```bash
+cd "$FLUXFER_ROOT"
+uv venv --python 3.12 .venv-vllm-lmcache
+source .venv-vllm-lmcache/bin/activate
+uv pip install "vllm==0.23.0" "lmcache==0.4.5"
+```
+
+Create the LMCache configuration reproducibly:
+
+```bash
+cat > "$FLUXFER_ROOT/lmcache_config.yaml" <<'YAML'
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 64
+use_layerwise: true
+save_unfull_chunk: false
+YAML
+```
+
+Start the server:
+
+```bash
+cd "$FLUXFER_ROOT"
+CUDA_VISIBLE_DEVICES=0 \
+LMCACHE_CONFIG_FILE="$FLUXFER_ROOT/lmcache_config.yaml" \
+vllm serve "$MODEL_PATH" \
+  --port 8080 \
+  --block-size 16 \
+  --kv-transfer-config \
+  '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+```
+
+Replay the same trace:
+
+```bash
+"$FLUXFER_ROOT/trace-replayer/target/release/client" \
+  --tokenizer "$MODEL_PATH/tokenizer.json" \
+  --tokenizer-config "$MODEL_PATH/tokenizer_config.json" \
+  --endpoint http://localhost:8080/v1/chat/completions \
+  --api openai \
+  --dataset bailian \
+  --dataset-path "$TRACE_PATH" \
+  --output-path "$RESULTS_DIR/vllm_lmcache_traceA" \
+  --scale-factor 1.0 \
+  --time-in-secs 7500 \
+  --model-name "$MODEL_PATH" \
+  --stream
+```
+
+### SGLang + Direct I/O
+
+Create a separate environment:
+
+```bash
+cd "$FLUXFER_ROOT"
+uv venv --python 3.12 .venv-sglang-direct
+source .venv-sglang-direct/bin/activate
+uv pip install --prerelease=allow "sglang==0.5.12" "kernels<0.15"
+```
+
+Start upstream SGLang with its hierarchical cache and direct I/O backend:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 64 \
+  --page-size 16 \
+  --hicache-io-backend direct
+```
+
+Replay the same trace:
+
+```bash
+"$FLUXFER_ROOT/trace-replayer/target/release/client" \
+  --tokenizer "$MODEL_PATH/tokenizer.json" \
+  --tokenizer-config "$MODEL_PATH/tokenizer_config.json" \
+  --endpoint http://localhost:30000/v1/chat/completions \
+  --api openai \
+  --dataset bailian \
+  --dataset-path "$TRACE_PATH" \
+  --output-path "$RESULTS_DIR/sglang_direct_traceA" \
+  --scale-factor 1.0 \
+  --time-in-secs 7500 \
+  --model-name "$MODEL_PATH" \
+  --stream
+```
+
+### Strata
+
+Strata has been implemented in upstream SGLang. In this artifact, we evaluate
+Strata using SGLang's hierarchical cache with the kernel I/O backend.
+
+Create a separate environment:
+
+```bash
+cd "$FLUXFER_ROOT"
+uv venv --python 3.12 .venv-strata
+source .venv-strata/bin/activate
+uv pip install --prerelease=allow "sglang==0.5.12" "kernels<0.15"
+```
+
+Start the server:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 64 \
+  --page-size 16 \
+  --hicache-io-backend kernel
+```
+
+Replay the same trace:
+
+```bash
+"$FLUXFER_ROOT/trace-replayer/target/release/client" \
+  --tokenizer "$MODEL_PATH/tokenizer.json" \
+  --tokenizer-config "$MODEL_PATH/tokenizer_config.json" \
+  --endpoint http://localhost:30000/v1/chat/completions \
+  --api openai \
+  --dataset bailian \
+  --dataset-path "$TRACE_PATH" \
+  --output-path "$RESULTS_DIR/strata_traceA" \
+  --scale-factor 1.0 \
+  --time-in-secs 7500 \
+  --model-name "$MODEL_PATH" \
+  --stream
+```
