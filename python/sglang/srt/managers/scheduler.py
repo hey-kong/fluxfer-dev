@@ -259,7 +259,8 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 
-# Balanced Batch Formation uses the hybrid H2D model/hardware profile.
+# Default used when no complete model/hardware hybrid loading profile is supplied.
+HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 4.0
 # Hybrid H2D preload should only run when the final prefill batch has enough
 # compute to overlap with the preload phase.
 HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS = 100
@@ -1372,9 +1373,13 @@ class Scheduler(
             return True
         next_load = state.load_tokens + estimate.extra_load_tokens
         next_compute = state.compute_tokens + estimate.compute_tokens
-        return next_load / max(next_compute, 1) <= (
-            self.tree_cache.hybrid_loading_profile.overlap_tokens_per_compute_token
+        profile = getattr(self.tree_cache, "hybrid_loading_profile", None)
+        loading_bound_ratio = (
+            profile.overlap_tokens_per_compute_token
+            if profile is not None
+            else HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
         )
+        return next_load / max(next_compute, 1) <= loading_bound_ratio
 
     @staticmethod
     def _hybrid_bbf_commit_req(

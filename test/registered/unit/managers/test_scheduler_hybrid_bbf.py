@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_policy import AddReqResult  # noqa: E402
 from sglang.srt.mem_cache.hybrid_loading import HybridLoadingProfile  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
+    HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO,
     HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS,
     HybridBalancedPrefillState,
     Scheduler,
@@ -195,7 +196,23 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
 
         self.assertEqual(estimate.extra_load_tokens, 7)
         self.assertEqual(estimate.compute_tokens, 3)
-        self.assertEqual(scheduler.tree_cache.hybrid_loading_profile.overlap_tokens_per_compute_token, 4.0)
+        self.assertEqual(
+            scheduler.tree_cache.hybrid_loading_profile.overlap_tokens_per_compute_token,
+            4.0,
+        )
+
+    def test_ratio_falls_back_for_cache_without_profile(self):
+        scheduler = self._scheduler(_Node(0))
+        del scheduler.tree_cache.hybrid_loading_profile
+        state = HybridBalancedPrefillState(load_tokens=4, compute_tokens=1)
+        estimate = SimpleNamespace(extra_load_tokens=4, compute_tokens=1)
+        adder = SimpleNamespace(can_run_list=[object()])
+        req = _req()
+
+        self.assertEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 4.0)
+        self.assertTrue(
+            scheduler._hybrid_bbf_should_admit(req, adder, state, estimate)
+        )
 
     def test_balanced_prefill_prioritizes_bundle_hits_after_anchor(self):
         root = _Node(0)

@@ -667,9 +667,9 @@ class ServerArgs:
     enable_hybrid_balanced_batch: bool = False
     enable_hybrid_bubble_filling: bool = False
     # Model/hardware profile consumed by transfer-aware hybrid H2D loading.
-    hicache_hybrid_full_bandwidth_gbps: float = 24.0
-    hicache_hybrid_layer_bandwidth_gbps: float = 12.0
-    hicache_hybrid_compute_us_per_token_layer: float = 0.5
+    hicache_hybrid_full_bandwidth_gbps: Optional[float] = None
+    hicache_hybrid_layer_bandwidth_gbps: Optional[float] = None
+    hicache_hybrid_compute_us_per_token_layer: Optional[float] = None
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"

@@ -43,6 +43,9 @@ from sglang.srt.mem_cache.unified_cache_components import (
 )
 from sglang.srt.session.streaming_session import StreamingSession
 
+HICACHE_HYBRID_LOADING_BOUND_RATIO = 4.0
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -326,15 +329,28 @@ class UnifiedRadixCache(BasePrefixCache):
 
         from sglang.srt.mem_cache.hybrid_loading import HybridLoadingProfile
 
-        layer_num = self.cache_controller.layer_num
-        self.hybrid_loading_profile = HybridLoadingProfile(
-            full_bandwidth_bytes_per_s=server_args.hicache_hybrid_full_bandwidth_gbps * 1e9,
-            layer_bandwidth_bytes_per_s=server_args.hicache_hybrid_layer_bandwidth_gbps * 1e9,
-            compute_s_per_token_layer=server_args.hicache_hybrid_compute_us_per_token_layer * 1e-6,
-            layer_num=layer_num,
-            kv_bytes_per_token_layer=self.cache_controller.mem_pool_host.get_size_per_token() / layer_num,
+        profile_values = (
+            server_args.hicache_hybrid_full_bandwidth_gbps,
+            server_args.hicache_hybrid_layer_bandwidth_gbps,
+            server_args.hicache_hybrid_compute_us_per_token_layer,
         )
-        logger.info("Hybrid H2D loading profile: %s", self.hybrid_loading_profile)
+        if any(value is not None for value in profile_values) and not all(
+            value is not None for value in profile_values
+        ):
+            raise ValueError(
+                "all three hybrid loading profile parameters must be specified together"
+            )
+        self.hybrid_loading_profile = None
+        if all(value is not None for value in profile_values):
+            layer_num = self.cache_controller.layer_num
+            self.hybrid_loading_profile = HybridLoadingProfile(
+                full_bandwidth_bytes_per_s=profile_values[0] * 1e9,
+                layer_bandwidth_bytes_per_s=profile_values[1] * 1e9,
+                compute_s_per_token_layer=profile_values[2] * 1e-6,
+                layer_num=layer_num,
+                kv_bytes_per_token_layer=self.cache_controller.mem_pool_host.get_size_per_token() / layer_num,
+            )
+            logger.info("Hybrid H2D loading profile: %s", self.hybrid_loading_profile)
 
         # State initialization
         self.write_through_threshold = (
@@ -1359,9 +1375,16 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
 
         compute_tokens = max(req.extend_input_len - host_tokens, 0)
-        return self.hybrid_loading_profile.select_preload_pages(
-            host_tokens, self.page_size, compute_tokens
-        )
+        if self.hybrid_loading_profile is not None:
+            return self.hybrid_loading_profile.select_preload_pages(
+                host_tokens, self.page_size, compute_tokens
+            )
+
+        total_pages = (host_tokens + self.page_size - 1) // self.page_size
+        max_overlap_tokens = HICACHE_HYBRID_LOADING_BOUND_RATIO * compute_tokens
+        preload_tokens = max(host_tokens - max_overlap_tokens, 0)
+        preload_pages = (preload_tokens + self.page_size - 1) // self.page_size
+        return min(preload_pages, total_pages)
 
     def load_back(
         self,
