@@ -666,6 +666,10 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     enable_hybrid_balanced_batch: bool = False
     enable_hybrid_bubble_filling: bool = False
+    # Model/hardware profile consumed by transfer-aware hybrid H2D loading.
+    hicache_hybrid_full_bandwidth_gbps: Optional[float] = None
+    hicache_hybrid_layer_bandwidth_gbps: Optional[float] = None
+    hicache_hybrid_compute_us_per_token_layer: Optional[float] = None
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
@@ -6329,6 +6333,9 @@ class ServerArgs:
             default=ServerArgs.enable_hybrid_bubble_filling,
             help="Enable decode bubble filling while hybrid HiCache prefill preload is still in flight. Requires --hicache-io-backend=hybrid.",
         )
+        parser.add_argument("--hicache-hybrid-full-bandwidth-gbps", type=float, default=ServerArgs.hicache_hybrid_full_bandwidth_gbps, help="Profiled effective full-block H2D bandwidth used by hybrid loading.")
+        parser.add_argument("--hicache-hybrid-layer-bandwidth-gbps", type=float, default=ServerArgs.hicache_hybrid_layer_bandwidth_gbps, help="Profiled effective per-layer H2D bandwidth used by hybrid loading.")
+        parser.add_argument("--hicache-hybrid-compute-us-per-token-layer", type=float, default=ServerArgs.hicache_hybrid_compute_us_per_token_layer, help="Profiled average prefill compute time per token per Transformer layer.")
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
