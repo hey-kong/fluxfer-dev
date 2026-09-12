@@ -324,6 +324,18 @@ class UnifiedRadixCache(BasePrefixCache):
             attn_tp_group=params.attn_tp_cache_group,
         )
 
+        from sglang.srt.mem_cache.hybrid_loading import HybridLoadingProfile
+
+        layer_num = self.cache_controller.layer_num
+        self.hybrid_loading_profile = HybridLoadingProfile(
+            full_bandwidth_bytes_per_s=server_args.hicache_hybrid_full_bandwidth_gbps * 1e9,
+            layer_bandwidth_bytes_per_s=server_args.hicache_hybrid_layer_bandwidth_gbps * 1e9,
+            compute_s_per_token_layer=server_args.hicache_hybrid_compute_us_per_token_layer * 1e-6,
+            layer_num=layer_num,
+            kv_bytes_per_token_layer=self.cache_controller.mem_pool_host.get_size_per_token() / layer_num,
+        )
+        logger.info("Hybrid H2D loading profile: %s", self.hybrid_loading_profile)
+
         # State initialization
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -1347,17 +1359,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
 
         compute_tokens = max(req.extend_input_len - host_tokens, 0)
-        total_pages = (host_tokens + self.page_size - 1) // self.page_size
-        if compute_tokens == 0:
-            return total_pages
-
-        max_overlap_tokens = 4 * compute_tokens
-        if host_tokens <= max_overlap_tokens:
-            return 0
-
-        preload_tokens = host_tokens - max_overlap_tokens
-        preload_pages = (preload_tokens + self.page_size - 1) // self.page_size
-        return min(max(preload_pages, 0), total_pages)
+        return self.hybrid_loading_profile.select_preload_pages(
+            host_tokens, self.page_size, compute_tokens
+        )
 
     def load_back(
         self,

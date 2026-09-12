@@ -259,9 +259,7 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 
-# Balanced Batch Formation for HiCache hybrid I/O.  The ratio mirrors the
-# hybrid H2D preload heuristic in unified_radix_cache.py.
-HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 4.0
+# Balanced Batch Formation uses the hybrid H2D model/hardware profile.
 # Hybrid H2D preload should only run when the final prefill batch has enough
 # compute to overlap with the preload phase.
 HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS = 100
@@ -1374,8 +1372,8 @@ class Scheduler(
             return True
         next_load = state.load_tokens + estimate.extra_load_tokens
         next_compute = state.compute_tokens + estimate.compute_tokens
-        return (
-            next_load / max(next_compute, 1) <= HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
+        return next_load / max(next_compute, 1) <= (
+            self.tree_cache.hybrid_loading_profile.overlap_tokens_per_compute_token
         )
 
     @staticmethod

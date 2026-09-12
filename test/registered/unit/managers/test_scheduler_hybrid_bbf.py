@@ -11,8 +11,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_policy import AddReqResult  # noqa: E402
+from sglang.srt.mem_cache.hybrid_loading import HybridLoadingProfile  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
-    HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO,
     HICACHE_HYBRID_PRELOAD_MIN_BATCH_COMPUTE_TOKENS,
     HybridBalancedPrefillState,
     Scheduler,
@@ -59,6 +59,7 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         scheduler.tree_cache = SimpleNamespace(
             root_node=root,
             cache_controller=SimpleNamespace(io_backend="hybrid"),
+            hybrid_loading_profile=HybridLoadingProfile(24e9, 12e9, 0.5e-6, 32, 1500),
         )
         scheduler.server_args = SimpleNamespace(
             enable_hybrid_balanced_batch=True,
@@ -194,7 +195,7 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
 
         self.assertEqual(estimate.extra_load_tokens, 7)
         self.assertEqual(estimate.compute_tokens, 3)
-        self.assertEqual(HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO, 4.0)
+        self.assertEqual(scheduler.tree_cache.hybrid_loading_profile.overlap_tokens_per_compute_token, 4.0)
 
     def test_balanced_prefill_prioritizes_bundle_hits_after_anchor(self):
         root = _Node(0)
