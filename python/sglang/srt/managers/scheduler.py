@@ -3499,7 +3499,10 @@ class Scheduler(
         prefill_profile_end = None
         if (
             self.is_generation
-            and batch.forward_mode.is_extend()
+            # MIXED also satisfies is_extend(), but its layer kernels combine
+            # prefill and running decode requests. Their device time cannot be
+            # attributed to prefill tokens alone, so only profile pure prefill.
+            and batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
             and self.enable_hierarchical_cache
         ):
             cache_controller = getattr(self.tree_cache, "cache_controller", None)
