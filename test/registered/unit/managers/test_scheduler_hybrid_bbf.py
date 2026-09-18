@@ -117,6 +117,13 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         ]
         self.assertFalse(scheduler._hybrid_prefill_load_queue_has_preload_pages())
 
+    def test_online_batch_tokens_use_current_chunk_and_logical_prefix(self):
+        reqs = [
+            _req(extend_input_len=128, prefix_indices=torch.arange(256)),
+            _req(extend_input_len=32, prefix_indices=torch.arange(64)),
+        ]
+        self.assertEqual(Scheduler._online_hybrid_batch_tokens(reqs), (160, 320))
+
     def test_preload_pages_disabled_for_small_final_compute_batch(self):
         scheduler = self._scheduler(_Node(0))
         scheduler.tree_cache.cache_controller.load_queue = [

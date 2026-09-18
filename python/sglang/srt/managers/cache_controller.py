@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -59,7 +60,12 @@ class LayerLoadingEvent:
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
+        recorder = getattr(self, "compute_recorder", None)
+        if recorder is not None:
+            recorder.begin_wait()
         device_module.current_stream().wait_event(self.load_events[layer_index])
+        if recorder is not None:
+            recorder.end_wait()
 
     @property
     def finish_event(self):
@@ -74,6 +80,7 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self.compute_recorder = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -86,6 +93,8 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+        for event in self.events:
+            event.compute_recorder = self.compute_recorder
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
@@ -95,6 +104,25 @@ class LayerDoneCounter:
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+
+
+@dataclass
+class HybridBatchMeasurement:
+    sequence: int
+    q: int
+    h: int
+    host_pages: int
+    full_pages: int
+    layer_pages: int
+    fallback_reason: Optional[str]
+    estimated_preload_seconds: Optional[float] = None
+    full_bytes: int = 0
+    layer_bytes: int = 0
+    full_start: object = None
+    full_end: object = None
+    layer_start: object = None
+    layer_end: object = None
+    compute_end: object = None
 
 
 class CacheOperation:
@@ -335,6 +363,12 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+        self.online_prefill_cost = None
+        self.hybrid_transfer_samples = None
+        self.hybrid_batch_sequence = 0
+        self.hybrid_pending_measurements = []
+        self.hybrid_next_measurement = None
+        self.prefill_compute_recorder = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -828,6 +862,142 @@ class HiCacheController:
             _cat(tail_device_indices),
         )
 
+    def init_online_hybrid_loading(self, max_batch_tokens: int) -> None:
+        from sglang.srt.mem_cache.online_prefill_cost import (
+            LatestTransferSamples,
+            OnlinePrefillCostSynopsis,
+            PrefillComputeEventRecorder,
+        )
+
+        self.online_prefill_cost = OnlinePrefillCostSynopsis(max_batch_tokens)
+        self.hybrid_transfer_samples = LatestTransferSamples()
+        self.prefill_compute_recorder = PrefillComputeEventRecorder(
+            self.online_prefill_cost,
+            device_module.Event,
+            self.finish_online_prefill_compute,
+        )
+        self.layer_done_counter.compute_recorder = self.prefill_compute_recorder
+
+    def finish_online_prefill_compute(self, compute_end) -> None:
+        item = self.hybrid_next_measurement
+        if item is not None:
+            item.compute_end = compute_end
+            if item.host_pages == 0:
+                self.hybrid_pending_measurements.append(item)
+                self.hybrid_next_measurement = None
+            return
+        for pending in reversed(self.hybrid_pending_measurements):
+            if pending.compute_end is None:
+                pending.compute_end = compute_end
+                return
+
+    def prepare_online_hybrid_batch(
+        self, q: int, h: int, force_layer_wise_reason: Optional[str] = None
+    ) -> HybridBatchMeasurement:
+        from sglang.srt.mem_cache.online_prefill_cost import (
+            allocate_preload_pages,
+            select_batch_split,
+        )
+
+        self.collect_hybrid_measurements()
+        if self.prefill_compute_recorder is not None:
+            self.prefill_compute_recorder.prepare(q, h)
+        self.hybrid_batch_sequence += 1
+        host_pages = sum(
+            (len(op.host_indices) + self.page_size - 1) // self.page_size
+            for op in self.load_queue
+        )
+        bytes_per_page_per_layer = int(
+            self.mem_pool_host.get_size_per_token() / self.layer_num * self.page_size
+        )
+        compute_seconds = self.online_prefill_cost.estimate(q, h) if q > 0 else None
+        layer_sample = self.hybrid_transfer_samples.layer_wise
+        if force_layer_wise_reason is not None:
+            full_pages, layer_pages, reason = (
+                0,
+                host_pages,
+                force_layer_wise_reason,
+            )
+        else:
+            full_pages, layer_pages, reason = select_batch_split(
+                host_pages, bytes_per_page_per_layer, compute_seconds, layer_sample
+            )
+        operation_page_counts = [
+            (len(op.host_indices) + self.page_size - 1) // self.page_size
+            for op in self.load_queue
+        ]
+        for op, preload_pages in zip(
+            self.load_queue,
+            allocate_preload_pages(operation_page_counts, full_pages),
+        ):
+            op.h2d_preload_pages = preload_pages
+        full_sample = self.hybrid_transfer_samples.full_block
+        estimated_preload_seconds = (
+            full_pages * bytes_per_page_per_layer * self.layer_num
+            / full_sample.bandwidth_bytes_per_second
+            if full_pages > 0 and full_sample is not None
+            else None
+        )
+        measurement = HybridBatchMeasurement(
+            self.hybrid_batch_sequence,
+            q,
+            h,
+            host_pages,
+            full_pages,
+            layer_pages,
+            reason,
+            estimated_preload_seconds,
+        )
+        self.hybrid_next_measurement = measurement
+        return measurement
+
+    def collect_hybrid_measurements(self) -> None:
+        from sglang.srt.mem_cache.online_prefill_cost import TransferSample
+
+        remaining = []
+        for item in self.hybrid_pending_measurements:
+            if item.q > 0 and item.compute_end is None:
+                remaining.append(item)
+                continue
+            events = [
+                event
+                for event in (item.full_end, item.layer_end, item.compute_end)
+                if event is not None
+            ]
+            if any(not event.query() for event in events):
+                remaining.append(item)
+                continue
+            reasons = []
+            full_bw = None
+            layer_bw = None
+            if item.full_end is not None:
+                elapsed = item.full_start.elapsed_time(item.full_end) / 1000.0
+                if self.hybrid_transfer_samples.update(
+                    "full_block", TransferSample(item.sequence, item.full_bytes, elapsed)
+                ):
+                    full_bw = TransferSample(item.sequence, item.full_bytes, elapsed).bandwidth_gbps
+                else:
+                    reasons.append("invalid-full-block-measurement")
+            if item.layer_end is not None:
+                elapsed = item.layer_start.elapsed_time(item.layer_end) / 1000.0
+                if self.hybrid_transfer_samples.update(
+                    "layer_wise", TransferSample(item.sequence, item.layer_bytes, elapsed)
+                ):
+                    layer_bw = TransferSample(item.sequence, item.layer_bytes, elapsed).bandwidth_gbps
+                else:
+                    reasons.append("invalid-layer-wise-measurement")
+            reason = item.fallback_reason or (",".join(reasons) if reasons else "none")
+            logger.info(
+                "Hybrid KV batch=%d rank=%d Q=%d H=%d N=%d full_pages=%d layer_pages=%d full_GBps=%s layer_GBps=%s estimated_preload_ms=%s fallback=%s",
+                item.sequence, get_tensor_model_parallel_rank(), item.q, item.h,
+                item.host_pages, item.full_pages, item.layer_pages,
+                "N/A" if full_bw is None else f"{full_bw:.3f}",
+                "N/A" if layer_bw is None else f"{layer_bw:.3f}",
+                "N/A" if item.estimated_preload_seconds is None else f"{item.estimated_preload_seconds * 1000:.3f}",
+                reason,
+            )
+        self.hybrid_pending_measurements = remaining
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -836,6 +1006,8 @@ class HiCacheController:
         ops = list(self.load_queue)
         op = CacheOperation.merge_ops(ops)
         self.load_queue.clear()
+        hybrid_measurement = self.hybrid_next_measurement
+        self.hybrid_next_measurement = None
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -850,6 +1022,11 @@ class HiCacheController:
                 ) = self._split_hybrid_load_ops(ops)
 
                 if preload_host_indices is not None:
+                    if hybrid_measurement is not None:
+                        hybrid_measurement.full_start = device_module.Event(enable_timing=True)
+                        hybrid_measurement.full_end = device_module.Event(enable_timing=True)
+                        hybrid_measurement.full_bytes = len(preload_host_indices) * self.mem_pool_host.get_size_per_token()
+                        hybrid_measurement.full_start.record()
                     staged = None
                     staged_draft = None
                     if hasattr(self.mem_pool_host, "stage_pages_to_device"):
@@ -934,7 +1111,15 @@ class HiCacheController:
                         if preload_device_indices.is_cuda:
                             preload_device_indices.record_stream(self.load_stream)
 
+                if preload_host_indices is not None and hybrid_measurement is not None:
+                    hybrid_measurement.full_end.record()
+
                 if tail_host_indices is not None:
+                    if hybrid_measurement is not None:
+                        hybrid_measurement.layer_start = device_module.Event(enable_timing=True)
+                        hybrid_measurement.layer_end = device_module.Event(enable_timing=True)
+                        hybrid_measurement.layer_bytes = len(tail_host_indices) * self.mem_pool_host.get_size_per_token()
+                        hybrid_measurement.layer_start.record()
                     tail_device_indices = tail_device_indices.cpu()
                     for i in range(self.layer_num):
                         self.mem_pool_host.load_to_device_per_layer(
@@ -953,6 +1138,8 @@ class HiCacheController:
                                 "direct",
                             )
                         producer_event.complete(i)
+                    if hybrid_measurement is not None:
+                        hybrid_measurement.layer_end.record()
             else:
                 host_indices, device_indices = self.move_indices(
                     op.host_indices, op.device_indices
@@ -978,6 +1165,9 @@ class HiCacheController:
                     host_indices.record_stream(self.load_stream)
                 if device_indices.is_cuda:
                     device_indices.record_stream(self.load_stream)
+
+        if hybrid_measurement is not None:
+            self.hybrid_pending_measurements.append(hybrid_measurement)
 
         self.ack_load_queue.append(
             HiCacheAck(
