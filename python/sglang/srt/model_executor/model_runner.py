@@ -833,10 +833,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.hicache_io_backend != "hybrid":
             return
 
-        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
-        if counter is None:
-            return
-
         candidates = [self.model]
         for _ in range(3):
             candidates.extend(
@@ -862,15 +858,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         for index, layer in enumerate(layer_model.layers):
             layer_index = getattr(layer, "layer_id", index)
             layer.register_forward_pre_hook(
-                lambda _module, _inputs, i=layer_index: counter.record_prefill_layer_start(
+                lambda _module, _inputs, i=layer_index: self._record_prefill_layer_start(
                     i
                 )
             )
             layer.register_forward_hook(
-                lambda _module, _inputs, _output, i=layer_index: counter.record_prefill_layer_end(
+                lambda _module, _inputs, _output, i=layer_index: self._record_prefill_layer_end(
                     i
                 )
             )
+        logger.info(
+            "Registered hybrid HiCache prefill timing hooks on %d Transformer layers",
+            len(layer_model.layers),
+        )
+
+    def _get_layer_transfer_counter(self):
+        # HiCache is attached after ModelRunner initialization, so this must be
+        # resolved when the hook runs rather than when the hook is registered.
+        return getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+
+    def _record_prefill_layer_start(self, layer_index: int):
+        counter = self._get_layer_transfer_counter()
+        if counter is not None:
+            counter.record_prefill_layer_start(layer_index)
+
+    def _record_prefill_layer_end(self, layer_index: int):
+        counter = self._get_layer_transfer_counter()
+        if counter is not None:
+            counter.record_prefill_layer_end(layer_index)
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
