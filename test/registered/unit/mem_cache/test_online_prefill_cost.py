@@ -6,6 +6,8 @@ from sglang.srt.mem_cache.online_prefill_cost import (
     OnlinePrefillCostSynopsis,
     TransferSample,
     select_batch_split,
+    select_fixed_ratio_split,
+    supports_online_prefill_cost,
 )
 
 
@@ -72,7 +74,8 @@ def test_compute_recorder_subtracts_only_observed_waits():
 
     synopsis = OnlinePrefillCostSynopsis(128)
     recorder = PrefillComputeEventRecorder(synopsis, _Event)
-    recorder.prepare(100, 0)
+    recorder.prepare(1, 100, 0)
+    recorder.activate_next()
     recorder.begin_layer()
     _Event.clock = 2.0
     recorder.begin_wait()
@@ -89,3 +92,28 @@ def test_compute_recorder_subtracts_only_observed_waits():
 def test_batch_budget_is_allocated_once_in_root_order():
     assert allocate_preload_pages([2, 3, 4], 6) == [2, 3, 1]
     assert allocate_preload_pages([2, 3], 0) == [0, 0]
+
+
+def test_recorder_state_is_not_activated_by_intervening_work():
+    from sglang.srt.mem_cache.online_prefill_cost import PrefillComputeEventRecorder
+
+    synopsis = OnlinePrefillCostSynopsis(128)
+    recorder = PrefillComputeEventRecorder(synopsis, _Event)
+    recorder.prepare(7, 64, 0)
+    assert recorder.active is None
+    assert len(recorder.prepared) == 1
+    recorder.activate_next()
+    assert recorder.active.sequence == 7
+
+
+def test_unsupported_model_uses_fixed_four_to_one_ratio():
+    assert select_fixed_ratio_split(10, 16, 20) == (5, 5)
+    assert select_fixed_ratio_split(10, 16, 40) == (0, 10)
+    assert select_fixed_ratio_split(10, 16, 0) == (10, 0)
+
+
+def test_only_instrumented_model_families_enable_online_synopsis():
+    assert supports_online_prefill_cost("LlamaForCausalLM")
+    assert supports_online_prefill_cost("MistralForCausalLM")
+    assert supports_online_prefill_cost("Mistral3ForConditionalGeneration")
+    assert not supports_online_prefill_cost("Qwen2ForCausalLM")

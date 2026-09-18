@@ -461,6 +461,13 @@ class TpModelWorker(BaseTpWorker):
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            if (
+                self.hicache_layer_transfer_counter is not None
+                and forward_batch.forward_mode.name in ("EXTEND", "MIXED")
+            ):
+                recorder = self.hicache_layer_transfer_counter.compute_recorder
+                if recorder is not None:
+                    recorder.activate_next()
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -542,6 +549,10 @@ class TpModelWorker(BaseTpWorker):
         if batch.split_index == 0:
             model_worker_batch = batch.get_model_worker_batch()
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            if self.hicache_layer_transfer_counter is not None:
+                recorder = self.hicache_layer_transfer_counter.compute_recorder
+                if recorder is not None:
+                    recorder.activate_next()
             batch.split_forward_batch = forward_batch
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
         else:

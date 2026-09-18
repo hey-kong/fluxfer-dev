@@ -123,6 +123,7 @@ class HybridBatchMeasurement:
     layer_start: object = None
     layer_end: object = None
     compute_end: object = None
+    requires_compute_end: bool = True
 
 
 class CacheOperation:
@@ -369,6 +370,7 @@ class HiCacheController:
         self.hybrid_pending_measurements = []
         self.hybrid_next_measurement = None
         self.prefill_compute_recorder = None
+        self.online_prefill_compute_supported = False
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -862,6 +864,12 @@ class HiCacheController:
             _cat(tail_device_indices),
         )
 
+    def _host_size_per_token(self) -> int:
+        size = getattr(self.mem_pool_host, "size_per_token", None)
+        if size is not None:
+            return int(size)
+        return int(self.mem_pool_host.get_size_per_token())
+
     def init_online_hybrid_loading(self, max_batch_tokens: int) -> None:
         from sglang.srt.mem_cache.online_prefill_cost import (
             LatestTransferSamples,
@@ -878,16 +886,16 @@ class HiCacheController:
         )
         self.layer_done_counter.compute_recorder = self.prefill_compute_recorder
 
-    def finish_online_prefill_compute(self, compute_end) -> None:
+    def finish_online_prefill_compute(self, sequence: int, compute_end) -> None:
         item = self.hybrid_next_measurement
-        if item is not None:
+        if item is not None and item.sequence == sequence:
             item.compute_end = compute_end
             if item.host_pages == 0:
                 self.hybrid_pending_measurements.append(item)
                 self.hybrid_next_measurement = None
             return
         for pending in reversed(self.hybrid_pending_measurements):
-            if pending.compute_end is None:
+            if pending.sequence == sequence and pending.compute_end is None:
                 pending.compute_end = compute_end
                 return
 
@@ -897,22 +905,31 @@ class HiCacheController:
         from sglang.srt.mem_cache.online_prefill_cost import (
             allocate_preload_pages,
             select_batch_split,
+            select_fixed_ratio_split,
         )
 
         self.collect_hybrid_measurements()
-        if self.prefill_compute_recorder is not None:
-            self.prefill_compute_recorder.prepare(q, h)
         self.hybrid_batch_sequence += 1
+        if (
+            self.online_prefill_compute_supported
+            and self.prefill_compute_recorder is not None
+        ):
+            self.prefill_compute_recorder.prepare(self.hybrid_batch_sequence, q, h)
         host_pages = sum(
             (len(op.host_indices) + self.page_size - 1) // self.page_size
             for op in self.load_queue
         )
         bytes_per_page_per_layer = int(
-            self.mem_pool_host.get_size_per_token() / self.layer_num * self.page_size
+            self._host_size_per_token() / self.layer_num * self.page_size
         )
         compute_seconds = self.online_prefill_cost.estimate(q, h) if q > 0 else None
         layer_sample = self.hybrid_transfer_samples.layer_wise
-        if force_layer_wise_reason is not None:
+        if not self.online_prefill_compute_supported:
+            full_pages, layer_pages = select_fixed_ratio_split(
+                host_pages, self.page_size, q
+            )
+            reason = "unsupported-model-fixed-ratio-4.0"
+        elif force_layer_wise_reason is not None:
             full_pages, layer_pages, reason = (
                 0,
                 host_pages,
@@ -947,8 +964,12 @@ class HiCacheController:
             layer_pages,
             reason,
             estimated_preload_seconds,
+            requires_compute_end=self.online_prefill_compute_supported,
         )
         self.hybrid_next_measurement = measurement
+        if host_pages == 0 and not measurement.requires_compute_end:
+            self.hybrid_pending_measurements.append(measurement)
+            self.hybrid_next_measurement = None
         return measurement
 
     def collect_hybrid_measurements(self) -> None:
@@ -956,7 +977,7 @@ class HiCacheController:
 
         remaining = []
         for item in self.hybrid_pending_measurements:
-            if item.q > 0 and item.compute_end is None:
+            if item.requires_compute_end and item.q > 0 and item.compute_end is None:
                 remaining.append(item)
                 continue
             events = [
@@ -1025,7 +1046,7 @@ class HiCacheController:
                     if hybrid_measurement is not None:
                         hybrid_measurement.full_start = device_module.Event(enable_timing=True)
                         hybrid_measurement.full_end = device_module.Event(enable_timing=True)
-                        hybrid_measurement.full_bytes = len(preload_host_indices) * self.mem_pool_host.get_size_per_token()
+                        hybrid_measurement.full_bytes = len(preload_host_indices) * self._host_size_per_token()
                         hybrid_measurement.full_start.record()
                     staged = None
                     staged_draft = None
@@ -1118,7 +1139,7 @@ class HiCacheController:
                     if hybrid_measurement is not None:
                         hybrid_measurement.layer_start = device_module.Event(enable_timing=True)
                         hybrid_measurement.layer_end = device_module.Event(enable_timing=True)
-                        hybrid_measurement.layer_bytes = len(tail_host_indices) * self.mem_pool_host.get_size_per_token()
+                        hybrid_measurement.layer_bytes = len(tail_host_indices) * self._host_size_per_token()
                         hybrid_measurement.layer_start.record()
                     tail_device_indices = tail_device_indices.cpu()
                     for i in range(self.layer_num):

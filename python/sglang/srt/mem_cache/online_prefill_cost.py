@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
 LENGTH_BUCKET_TOKENS = 128
 REUSE_BUCKET_WIDTH = 0.05
 SAMPLES_PER_BUCKET = 8
+ONLINE_PREFILL_COST_ARCHITECTURES = frozenset(
+    {
+        "LlamaForCausalLM",
+        "MistralForCausalLM",
+        "Mistral3ForConditionalGeneration",
+    }
+)
+
+
+def supports_online_prefill_cost(architecture: str) -> bool:
+    return architecture in ONLINE_PREFILL_COST_ARCHITECTURES
 
 
 class _SampleRing:
@@ -104,6 +116,13 @@ class LatestTransferSamples:
         return True
 
 
+def select_fixed_ratio_split(
+    host_pages: int, page_size: int, compute_tokens: int, ratio: float = 4.0
+) -> tuple[int, int]:
+    layer_pages = min(host_pages, math.floor(ratio * compute_tokens / page_size))
+    return host_pages - layer_pages, layer_pages
+
+
 def select_batch_split(
     host_pages: int,
     bytes_per_page_per_layer: int,
@@ -128,6 +147,7 @@ def select_batch_split(
 
 @dataclass
 class _PendingCompute:
+    sequence: int
     q: int
     h: int
     layer_events: list[tuple[object, object]]
@@ -145,11 +165,17 @@ class PrefillComputeEventRecorder:
         self.event_factory = event_factory
         self.finish_callback = finish_callback
         self.active: Optional[_PendingCompute] = None
+        self.prepared = deque()
         self.pending: list[_PendingCompute] = []
 
-    def prepare(self, q: int, h: int) -> None:
+    def prepare(self, sequence: int, q: int, h: int) -> None:
         self.collect()
-        self.active = _PendingCompute(q, h, [], []) if q > 0 else None
+        if q > 0:
+            self.prepared.append(_PendingCompute(sequence, q, h, [], []))
+
+    def activate_next(self) -> None:
+        if self.active is None and self.prepared:
+            self.active = self.prepared.popleft()
 
     def begin_layer(self) -> None:
         if self.active is None:
@@ -186,7 +212,9 @@ class PrefillComputeEventRecorder:
             self.active.update_synopsis = update_synopsis
             self.pending.append(self.active)
             if self.finish_callback is not None:
-                self.finish_callback(self.active.layer_events[-1][1])
+                self.finish_callback(
+                    self.active.sequence, self.active.layer_events[-1][1]
+                )
         self.active = None
 
     def discard(self) -> None:

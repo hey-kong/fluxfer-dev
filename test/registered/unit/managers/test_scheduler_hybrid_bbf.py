@@ -298,5 +298,14 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         )
 
 
+class TestHybridHostPoolCompatibility(CustomTestCase):
+    def test_host_pool_group_size_per_token_property(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = SimpleNamespace(size_per_token=4096)
+        self.assertEqual(controller._host_size_per_token(), 4096)
+
+
 if __name__ == "__main__":
     unittest.main()

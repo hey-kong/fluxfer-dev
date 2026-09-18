@@ -187,6 +187,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.online_prefill_cost import supports_online_prefill_cost
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -3319,6 +3320,11 @@ class Scheduler(
                 getattr(cache_controller, "io_backend", None) == "hybrid"
                 and hasattr(cache_controller, "prepare_online_hybrid_batch")
             ):
+                architectures = getattr(self.model_config.hf_config, "architectures", ())
+                architecture = architectures[0] if architectures else ""
+                cache_controller.online_prefill_compute_supported = (
+                    supports_online_prefill_cost(architecture)
+                )
                 q, h = self._online_hybrid_batch_tokens(can_run_list)
                 will_mix_decode = (
                     self.is_mixed_chunk

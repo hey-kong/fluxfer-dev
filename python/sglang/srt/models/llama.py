@@ -396,9 +396,6 @@ class LlamaModel(nn.Module):
         )
         record_prefill = forward_batch.forward_mode.name == "EXTEND"
         record_for_completion = forward_batch.forward_mode.name in ("EXTEND", "MIXED")
-        if recorder is not None and not record_for_completion:
-            recorder.discard()
-
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
