@@ -1142,6 +1142,10 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # Layer timing is always enabled for this build. Mixed chunked prefill
+        # combines prefill and decode in the same kernels, making pure prefill
+        # device time unobservable, so those batches must remain separate.
+        self.enable_prefill_layer_timing = True
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -3334,6 +3338,9 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Per-layer prefill timing must not include decode kernels. Keep the
+            # prefill batch pure instead of turning it into ForwardMode.MIXED.
+            and not self.enable_prefill_layer_timing
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
