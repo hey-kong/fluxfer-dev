@@ -137,3 +137,23 @@ def test_timing_events_are_reused_after_collection():
     recorder.activate_next()
     recorder.begin_layer()
     assert recorder.active.layer_events[-1] == first_pair
+
+
+def test_completion_callback_precedes_event_reuse():
+    from sglang.srt.mem_cache.online_prefill_cost import PrefillComputeEventRecorder
+
+    completions = []
+    synopsis = OnlinePrefillCostSynopsis(128)
+    recorder = PrefillComputeEventRecorder(synopsis, _Event, completions.append)
+    recorder.prepare(11, 32, 0)
+    recorder.activate_next()
+    recorder.begin_layer()
+    pair = recorder.active.layer_events[-1]
+    _Event.clock += 1
+    recorder.end_layer()
+    recorder.finish()
+
+    assert completions == []
+    recorder.collect()
+    assert completions == [11]
+    assert pair in recorder.event_pairs.free

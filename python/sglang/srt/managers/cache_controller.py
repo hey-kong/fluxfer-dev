@@ -127,7 +127,7 @@ class HybridBatchMeasurement:
     full_start: object = None
     full_end: object = None
     layer_event_pairs: list[tuple[object, object]] = field(default_factory=list)
-    compute_end: object = None
+    compute_completed: bool = False
     requires_compute_end: bool = True
 
 
@@ -893,17 +893,14 @@ class HiCacheController:
         )
         self.layer_done_counter.compute_recorder = self.prefill_compute_recorder
 
-    def finish_online_prefill_compute(self, sequence: int, compute_end) -> None:
+    def finish_online_prefill_compute(self, sequence: int) -> None:
         item = self.hybrid_next_measurement
         if item is not None and item.sequence == sequence:
-            item.compute_end = compute_end
-            if item.host_pages == 0:
-                self.hybrid_pending_measurements.append(item)
-                self.hybrid_next_measurement = None
+            item.compute_completed = True
             return
         for pending in reversed(self.hybrid_pending_measurements):
-            if pending.sequence == sequence and pending.compute_end is None:
-                pending.compute_end = compute_end
+            if pending.sequence == sequence:
+                pending.compute_completed = True
                 return
 
     def prepare_online_hybrid_batch(
@@ -915,6 +912,10 @@ class HiCacheController:
             select_fixed_ratio_split,
         )
 
+        # Publish compute completion before transfer collection so no consumer
+        # retains an event that the recorder may return to its reuse pool.
+        if self.prefill_compute_recorder is not None:
+            self.prefill_compute_recorder.collect()
         self.collect_hybrid_measurements()
         self.hybrid_batch_sequence += 1
         if (
@@ -974,7 +975,7 @@ class HiCacheController:
             requires_compute_end=self.online_prefill_compute_supported,
         )
         self.hybrid_next_measurement = measurement
-        if host_pages == 0 and not measurement.requires_compute_end:
+        if host_pages == 0:
             self.hybrid_pending_measurements.append(measurement)
             self.hybrid_next_measurement = None
         return measurement
@@ -984,7 +985,7 @@ class HiCacheController:
 
         remaining = []
         for item in self.hybrid_pending_measurements:
-            if item.requires_compute_end and item.q > 0 and item.compute_end is None:
+            if item.requires_compute_end and item.q > 0 and not item.compute_completed:
                 remaining.append(item)
                 continue
             events = [
@@ -992,7 +993,6 @@ class HiCacheController:
                 for event in (
                     item.full_end,
                     *(end for _, end in item.layer_event_pairs),
-                    item.compute_end,
                 )
                 if event is not None
             ]

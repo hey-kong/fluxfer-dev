@@ -225,10 +225,6 @@ class PrefillComputeEventRecorder:
         if self.active is not None and self.active.layer_events:
             self.active.update_synopsis = update_synopsis
             self.pending.append(self.active)
-            if self.finish_callback is not None:
-                self.finish_callback(
-                    self.active.sequence, self.active.layer_events[-1][1]
-                )
         self.active = None
 
     def discard(self) -> None:
@@ -251,6 +247,10 @@ class PrefillComputeEventRecorder:
             pure_seconds = max(layer_seconds - wait_seconds, 0.0)
             if pure_seconds > 0 and item.update_synopsis:
                 self.synopsis.add(item.q, item.h, pure_seconds / len(item.layer_events))
+            # Publish an immutable completion state before returning events to
+            # the pool. Consumers must not retain an event that can be reused.
+            if self.finish_callback is not None:
+                self.finish_callback(item.sequence)
             for pair in item.layer_events + item.wait_events:
                 self.event_pairs.release(pair)
         self.pending = remaining

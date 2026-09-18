@@ -1987,12 +1987,14 @@ class Scheduler(
 
     def _collect_online_hybrid_stats(self) -> None:
         cache_controller = getattr(self.tree_cache, "cache_controller", None)
-        collect = getattr(cache_controller, "collect_hybrid_measurements", None)
-        if collect is not None:
-            collect()
+        # Publish immutable compute-completion flags before transfer samples
+        # consume them in the same scheduler iteration.
         recorder = getattr(cache_controller, "prefill_compute_recorder", None)
         if recorder is not None:
             recorder.collect()
+        collect = getattr(cache_controller, "collect_hybrid_measurements", None)
+        if collect is not None:
+            collect()
 
     @DynamicGradMode()
     def event_loop_normal(self):
