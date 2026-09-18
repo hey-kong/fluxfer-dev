@@ -74,6 +74,30 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self._prefill_profile_start = None
+        self._prefill_profile_waits = None
+
+    def start_prefill_profile(self):
+        """Start measuring device time, with layer-loading stalls tracked separately."""
+        self._prefill_profile_start = device_module.Event(enable_timing=True)
+        self._prefill_profile_waits = []
+        self._prefill_profile_start.record()
+
+    def finish_prefill_profile(self):
+        """Return (total_ms, layer_wait_ms) for the active prefill profile."""
+        if self._prefill_profile_start is None:
+            return None
+
+        end = device_module.Event(enable_timing=True)
+        end.record()
+        end.synchronize()
+        total_ms = self._prefill_profile_start.elapsed_time(end)
+        wait_ms = sum(
+            start.elapsed_time(stop) for start, stop in self._prefill_profile_waits
+        )
+        self._prefill_profile_start = None
+        self._prefill_profile_waits = None
+        return total_ms, wait_ms
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -90,11 +114,21 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        wait_start = wait_stop = None
+        if self._prefill_profile_waits is not None:
+            wait_start = device_module.Event(enable_timing=True)
+            wait_stop = device_module.Event(enable_timing=True)
+            wait_start.record()
         self.events[self.consumer_index].wait(threshold)
+        if wait_stop is not None:
+            wait_stop.record()
+            self._prefill_profile_waits.append((wait_start, wait_stop))
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self._prefill_profile_start = None
+        self._prefill_profile_waits = None
 
 
 class CacheOperation:

@@ -3495,6 +3495,17 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # Run forward
+        layer_done_counter = None
+        if (
+            self.is_generation
+            and batch.forward_mode.is_extend()
+            and self.enable_hierarchical_cache
+        ):
+            cache_controller = getattr(self.tree_cache, "cache_controller", None)
+            candidate = getattr(cache_controller, "layer_done_counter", None)
+            if candidate is not None:
+                layer_done_counter = candidate
+                layer_done_counter.start_prefill_profile()
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
@@ -3566,6 +3577,30 @@ class Scheduler(
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
             batch.output_ids = future_indices_or_next_token_ids
+
+            if layer_done_counter is not None:
+                profile = layer_done_counter.finish_prefill_profile()
+                if profile is not None:
+                    total_ms, layer_wait_ms = profile
+                    compute_ms = max(total_ms - layer_wait_ms, 0.0)
+                    new_tokens = sum(
+                        max(int(getattr(req, "extend_input_len", 0) or 0), 0)
+                        for req in batch.reqs
+                    )
+                    num_layers = layer_done_counter.num_layers
+                    if new_tokens > 0 and num_layers > 0:
+                        logger.info(
+                            "Prefill compute timing: new_tokens=%d, layers=%d, "
+                            "compute_ms_per_layer=%.3f, "
+                            "compute_us_per_new_token_layer=%.3f "
+                            "(total_device_ms=%.3f, excluded_layer_wait_ms=%.3f)",
+                            new_tokens,
+                            num_layers,
+                            compute_ms / num_layers,
+                            compute_ms * 1000 / new_tokens / num_layers,
+                            total_ms,
+                            layer_wait_ms,
+                        )
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
