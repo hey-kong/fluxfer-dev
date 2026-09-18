@@ -3602,16 +3602,23 @@ class Scheduler(
                         max(int(getattr(req, "extend_input_len", 0) or 0), 0)
                         for req in batch.reqs
                     )
+                    cached_tokens = sum(
+                        max(int(getattr(req, "cached_tokens", 0) or 0), 0)
+                        for req in batch.reqs
+                    )
                     if new_tokens > 0:
-                        for layer_index, compute_ms in layer_compute_ms:
+                        for layer_index, compute_ms, layer_wait_ms in layer_compute_ms:
                             logger.info(
                                 "Prefill layer compute timing: layer=%d, "
-                                "new_tokens=%d, compute_ms=%.3f, "
+                                "new_tokens=%d, excluded_cached_tokens=%d, "
+                                "compute_ms=%.3f, excluded_layer_wait_ms=%.3f, "
                                 "compute_us_per_new_token=%.3f "
-                                "(layer-wise loading wait excluded)",
+                                "(cached tokens and layer-wise loading wait excluded)",
                                 layer_index,
                                 new_tokens,
+                                cached_tokens,
                                 compute_ms,
+                                layer_wait_ms,
                                 compute_ms * 1000 / new_tokens,
                             )
                         logger.info(

@@ -132,10 +132,12 @@ class LayerDoneCounter:
             if stop is None:
                 continue
             elapsed_ms = start.elapsed_time(stop)
+            layer_wait_ms = wait_ms_by_layer.get(layer_index, 0.0)
             layer_compute_ms.append(
                 (
                     layer_index,
-                    max(elapsed_ms - wait_ms_by_layer.get(layer_index, 0), 0.0),
+                    max(elapsed_ms - layer_wait_ms, 0.0),
+                    layer_wait_ms,
                 )
             )
         self._prefill_profile_start = None
