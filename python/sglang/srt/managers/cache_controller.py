@@ -1046,18 +1046,25 @@ class HiCacheController:
         hybrid_measurement = self.hybrid_next_measurement
         self.hybrid_next_measurement = None
         producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
 
+        # Prepare every CPU index tensor before submitting full-block work. In
+        # particular, Tensor.cpu() may synchronize with prior GPU work; keeping
+        # it out of the load-stream submission section lets start_loading return
+        # promptly after enqueueing DMA so bubble filling can schedule decode.
+        if self.io_backend == "hybrid":
+            (
+                preload_host_indices,
+                preload_device_indices,
+                tail_host_indices,
+                tail_device_indices,
+            ) = self._split_hybrid_load_ops(ops)
+            if tail_device_indices is not None:
+                tail_device_indices = tail_device_indices.cpu()
+
+        producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             if self.io_backend == "hybrid":
-                (
-                    preload_host_indices,
-                    preload_device_indices,
-                    tail_host_indices,
-                    tail_device_indices,
-                ) = self._split_hybrid_load_ops(ops)
-
                 if preload_host_indices is not None:
                     if hybrid_measurement is not None:
                         (
@@ -1164,7 +1171,6 @@ class HiCacheController:
                         hybrid_measurement.layer_bytes = (
                             len(tail_host_indices) * self._host_size_per_token()
                         )
-                    tail_device_indices = tail_device_indices.cpu()
                     for i in range(self.layer_num):
                         timing_pair = None
                         if hybrid_measurement is not None:
