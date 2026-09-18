@@ -117,3 +117,23 @@ def test_only_instrumented_model_families_enable_online_synopsis():
     assert supports_online_prefill_cost("MistralForCausalLM")
     assert supports_online_prefill_cost("Mistral3ForConditionalGeneration")
     assert not supports_online_prefill_cost("Qwen2ForCausalLM")
+
+
+def test_timing_events_are_reused_after_collection():
+    from sglang.srt.mem_cache.online_prefill_cost import PrefillComputeEventRecorder
+
+    synopsis = OnlinePrefillCostSynopsis(128)
+    recorder = PrefillComputeEventRecorder(synopsis, _Event)
+    recorder.prepare(1, 32, 0)
+    recorder.activate_next()
+    recorder.begin_layer()
+    first_pair = recorder.active.layer_events[-1]
+    _Event.clock += 1
+    recorder.end_layer()
+    recorder.finish()
+    recorder.collect()
+
+    recorder.prepare(2, 32, 0)
+    recorder.activate_next()
+    recorder.begin_layer()
+    assert recorder.active.layer_events[-1] == first_pair

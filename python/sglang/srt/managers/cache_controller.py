@@ -16,7 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -120,8 +120,7 @@ class HybridBatchMeasurement:
     layer_bytes: int = 0
     full_start: object = None
     full_end: object = None
-    layer_start: object = None
-    layer_end: object = None
+    layer_event_pairs: list[tuple[object, object]] = field(default_factory=list)
     compute_end: object = None
     requires_compute_end: bool = True
 
@@ -875,10 +874,12 @@ class HiCacheController:
             LatestTransferSamples,
             OnlinePrefillCostSynopsis,
             PrefillComputeEventRecorder,
+            ReusableEventPairPool,
         )
 
         self.online_prefill_cost = OnlinePrefillCostSynopsis(max_batch_tokens)
         self.hybrid_transfer_samples = LatestTransferSamples()
+        self.hybrid_timing_event_pairs = ReusableEventPairPool(device_module.Event)
         self.prefill_compute_recorder = PrefillComputeEventRecorder(
             self.online_prefill_cost,
             device_module.Event,
@@ -982,7 +983,11 @@ class HiCacheController:
                 continue
             events = [
                 event
-                for event in (item.full_end, item.layer_end, item.compute_end)
+                for event in (
+                    item.full_end,
+                    *(end for _, end in item.layer_event_pairs),
+                    item.compute_end,
+                )
                 if event is not None
             ]
             if any(not event.query() for event in events):
@@ -999,12 +1004,17 @@ class HiCacheController:
                     full_bw = TransferSample(item.sequence, item.full_bytes, elapsed).bandwidth_gbps
                 else:
                     reasons.append("invalid-full-block-measurement")
-            if item.layer_end is not None:
-                elapsed = item.layer_start.elapsed_time(item.layer_end) / 1000.0
+            if item.layer_event_pairs:
+                elapsed = sum(
+                    start.elapsed_time(end)
+                    for start, end in item.layer_event_pairs
+                ) / 1000.0
                 if self.hybrid_transfer_samples.update(
                     "layer_wise", TransferSample(item.sequence, item.layer_bytes, elapsed)
                 ):
-                    layer_bw = TransferSample(item.sequence, item.layer_bytes, elapsed).bandwidth_gbps
+                    layer_bw = TransferSample(
+                        item.sequence, item.layer_bytes, elapsed
+                    ).bandwidth_gbps
                 else:
                     reasons.append("invalid-layer-wise-measurement")
             reason = item.fallback_reason or (",".join(reasons) if reasons else "none")
@@ -1017,6 +1027,12 @@ class HiCacheController:
                 "N/A" if item.estimated_preload_seconds is None else f"{item.estimated_preload_seconds * 1000:.3f}",
                 reason,
             )
+            if item.full_start is not None:
+                self.hybrid_timing_event_pairs.release(
+                    (item.full_start, item.full_end)
+                )
+            for pair in item.layer_event_pairs:
+                self.hybrid_timing_event_pairs.release(pair)
         self.hybrid_pending_measurements = remaining
 
     def start_loading(self) -> int:
@@ -1044,8 +1060,10 @@ class HiCacheController:
 
                 if preload_host_indices is not None:
                     if hybrid_measurement is not None:
-                        hybrid_measurement.full_start = device_module.Event(enable_timing=True)
-                        hybrid_measurement.full_end = device_module.Event(enable_timing=True)
+                        (
+                            hybrid_measurement.full_start,
+                            hybrid_measurement.full_end,
+                        ) = self.hybrid_timing_event_pairs.acquire()
                         hybrid_measurement.full_bytes = len(preload_host_indices) * self._host_size_per_token()
                         hybrid_measurement.full_start.record()
                     staged = None
@@ -1143,12 +1161,16 @@ class HiCacheController:
 
                 if tail_host_indices is not None:
                     if hybrid_measurement is not None:
-                        hybrid_measurement.layer_start = device_module.Event(enable_timing=True)
-                        hybrid_measurement.layer_end = device_module.Event(enable_timing=True)
-                        hybrid_measurement.layer_bytes = len(tail_host_indices) * self._host_size_per_token()
-                        hybrid_measurement.layer_start.record()
+                        hybrid_measurement.layer_bytes = (
+                            len(tail_host_indices) * self._host_size_per_token()
+                        )
                     tail_device_indices = tail_device_indices.cpu()
                     for i in range(self.layer_num):
+                        timing_pair = None
+                        if hybrid_measurement is not None:
+                            timing_pair = self.hybrid_timing_event_pairs.acquire()
+                            hybrid_measurement.layer_event_pairs.append(timing_pair)
+                            timing_pair[0].record()
                         self.mem_pool_host.load_to_device_per_layer(
                             self.mem_pool_device,
                             tail_host_indices,
@@ -1164,9 +1186,9 @@ class HiCacheController:
                                 i,
                                 "direct_dma",
                             )
+                        if timing_pair is not None:
+                            timing_pair[1].record()
                         producer_event.complete(i)
-                    if hybrid_measurement is not None:
-                        hybrid_measurement.layer_end.record()
             else:
                 host_indices, device_indices = self.move_indices(
                     op.host_indices, op.device_indices

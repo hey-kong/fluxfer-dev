@@ -145,6 +145,25 @@ def select_batch_split(
     return host_pages - layer_pages, layer_pages, None
 
 
+class ReusableEventPairPool:
+    """Reuse timing events after their pending measurement has been consumed."""
+
+    def __init__(self, event_factory) -> None:
+        self.event_factory = event_factory
+        self.free: list[tuple[object, object]] = []
+
+    def acquire(self) -> tuple[object, object]:
+        if self.free:
+            return self.free.pop()
+        return (
+            self.event_factory(enable_timing=True),
+            self.event_factory(enable_timing=True),
+        )
+
+    def release(self, pair: tuple[object, object]) -> None:
+        self.free.append(pair)
+
+
 @dataclass
 class _PendingCompute:
     sequence: int
@@ -163,6 +182,7 @@ class PrefillComputeEventRecorder:
     ) -> None:
         self.synopsis = synopsis
         self.event_factory = event_factory
+        self.event_pairs = ReusableEventPairPool(event_factory)
         self.finish_callback = finish_callback
         self.active: Optional[_PendingCompute] = None
         self.prepared = deque()
@@ -180,32 +200,26 @@ class PrefillComputeEventRecorder:
     def begin_layer(self) -> None:
         if self.active is None:
             return
-        event = self.event_factory(enable_timing=True)
-        event.record()
-        self.active.layer_events.append((event, None))
+        start, end = self.event_pairs.acquire()
+        start.record()
+        self.active.layer_events.append((start, end))
 
     def end_layer(self) -> None:
         if self.active is None or not self.active.layer_events:
             return
-        event = self.event_factory(enable_timing=True)
-        event.record()
-        start, _ = self.active.layer_events[-1]
-        self.active.layer_events[-1] = (start, event)
+        self.active.layer_events[-1][1].record()
 
     def begin_wait(self) -> None:
         if self.active is None:
             return
-        event = self.event_factory(enable_timing=True)
-        event.record()
-        self.active.wait_events.append((event, None))
+        start, end = self.event_pairs.acquire()
+        start.record()
+        self.active.wait_events.append((start, end))
 
     def end_wait(self) -> None:
         if self.active is None or not self.active.wait_events:
             return
-        event = self.event_factory(enable_timing=True)
-        event.record()
-        start, _ = self.active.wait_events[-1]
-        self.active.wait_events[-1] = (start, event)
+        self.active.wait_events[-1][1].record()
 
     def finish(self, update_synopsis: bool = True) -> None:
         if self.active is not None and self.active.layer_events:
@@ -237,6 +251,8 @@ class PrefillComputeEventRecorder:
             pure_seconds = max(layer_seconds - wait_seconds, 0.0)
             if pure_seconds > 0 and item.update_synopsis:
                 self.synopsis.add(item.q, item.h, pure_seconds / len(item.layer_events))
+            for pair in item.layer_events + item.wait_events:
+                self.event_pairs.release(pair)
         self.pending = remaining
 
 
