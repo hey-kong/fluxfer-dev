@@ -3503,10 +3503,15 @@ class Scheduler(
             # prefill and running decode requests. Their device time cannot be
             # attributed to prefill tokens alone, so only profile pure prefill.
             and batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
-            and self.enable_hierarchical_cache
         ):
             cache_controller = getattr(self.tree_cache, "cache_controller", None)
             candidate = getattr(cache_controller, "layer_done_counter", None)
+            if candidate is None:
+                candidate = getattr(
+                    getattr(self.model_worker, "model_runner", None),
+                    "prefill_profiler",
+                    None,
+                )
             if candidate is not None:
                 layer_done_counter = candidate
                 layer_done_counter.start_prefill_profile()

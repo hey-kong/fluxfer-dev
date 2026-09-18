@@ -148,6 +148,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.prefill_profiler import LayerPrefillProfiler
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -821,18 +822,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        self._register_hicache_prefill_timing_hooks()
+        self.prefill_profiler = LayerPrefillProfiler()
+        self._register_prefill_timing_hooks()
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
 
-    def _register_hicache_prefill_timing_hooks(self):
-        """Attach exact layer entry/exit markers for hybrid HiCache profiling."""
-        if self.server_args.hicache_io_backend != "hybrid":
-            return
-
+    def _register_prefill_timing_hooks(self):
+        """Attach exact layer entry/exit markers for prefill profiling."""
         candidates = [self.model]
         for _ in range(3):
             candidates.extend(
@@ -850,8 +849,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if layer_model is None:
             logger.warning(
-                "Cannot register hybrid HiCache prefill timing hooks: "
-                "model has no layers attribute"
+                "Cannot register prefill timing hooks: model has no layers attribute"
             )
             return
 
@@ -868,14 +866,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
         logger.info(
-            "Registered hybrid HiCache prefill timing hooks on %d Transformer layers",
+            "Registered prefill timing hooks on %d Transformer layers",
             len(layer_model.layers),
         )
 
     def _get_layer_transfer_counter(self):
-        # HiCache is attached after ModelRunner initialization, so this must be
-        # resolved when the hook runs rather than when the hook is registered.
-        return getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+        # HiCache is attached after ModelRunner initialization. Resolve its
+        # counter lazily, and use the local profiler when HiCache is disabled.
+        return (
+            getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+            or self.prefill_profiler
+        )
 
     def _record_prefill_layer_start(self, layer_index: int):
         counter = self._get_layer_transfer_counter()
