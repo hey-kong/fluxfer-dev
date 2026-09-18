@@ -1062,6 +1062,8 @@ class HiCacheController:
                         )
 
                     if staged is not None:
+                        if hybrid_measurement is not None:
+                            hybrid_measurement.full_end.record()
                         staged_k, staged_v, staged_indices = staged
                         draft_staged_k = draft_staged_v = draft_staged_indices = None
                         if staged_draft is not None:
@@ -1132,7 +1134,11 @@ class HiCacheController:
                         if preload_device_indices.is_cuda:
                             preload_device_indices.record_stream(self.load_stream)
 
-                if preload_host_indices is not None and hybrid_measurement is not None:
+                if (
+                    preload_host_indices is not None
+                    and hybrid_measurement is not None
+                    and staged is None
+                ):
                     hybrid_measurement.full_end.record()
 
                 if tail_host_indices is not None:
@@ -1148,7 +1154,7 @@ class HiCacheController:
                             tail_host_indices,
                             tail_device_indices,
                             i,
-                            "direct",
+                            "direct_dma",
                         )
                         if self.has_draft and i < self.mem_pool_host_draft.layer_num:
                             self.mem_pool_host_draft.load_to_device_per_layer(
@@ -1156,7 +1162,7 @@ class HiCacheController:
                                 tail_host_indices,
                                 tail_device_indices,
                                 i,
-                                "direct",
+                                "direct_dma",
                             )
                         producer_event.complete(i)
                     if hybrid_measurement is not None:

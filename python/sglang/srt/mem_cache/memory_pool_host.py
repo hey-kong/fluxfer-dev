@@ -430,9 +430,30 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=device,
         )
         staged_v = torch.empty_like(staged_k)
-        for dst_page, src_page in enumerate(page_ids):
-            staged_k[dst_page].copy_(self.k_buffer[src_page], non_blocking=True)
-            staged_v[dst_page].copy_(self.v_buffer[src_page], non_blocking=True)
+        # Coalesce adjacent host pages into large cudaMemcpyAsync operations.
+        # The previous one-copy-per-page loop made full-block transfer dominated
+        # by launch overhead for small pages.
+        run_dst = 0
+        run_src = page_ids[0]
+        run_length = 1
+        for dst_page in range(1, num_pages + 1):
+            extends_run = (
+                dst_page < num_pages
+                and page_ids[dst_page] == run_src + run_length
+            )
+            if extends_run:
+                run_length += 1
+                continue
+            staged_k[run_dst : run_dst + run_length].copy_(
+                self.k_buffer[run_src : run_src + run_length], non_blocking=True
+            )
+            staged_v[run_dst : run_dst + run_length].copy_(
+                self.v_buffer[run_src : run_src + run_length], non_blocking=True
+            )
+            if dst_page < num_pages:
+                run_dst = dst_page
+                run_src = page_ids[dst_page]
+                run_length = 1
 
         staged_indices = torch.arange(
             num_pages * self.page_size, dtype=torch.int64, device=device
@@ -467,6 +488,39 @@ class MHATokenToKVPoolHost(HostKVCache):
             block_quota=1,
         )
 
+    def load_to_device_per_layer_dma(
+        self, device_pool, host_indices, device_indices, layer_id
+    ):
+        """Copy one layer with cudaMemcpyAsync, without a transfer kernel.
+
+        Page allocations are contiguous within each page. We deliberately issue
+        one DMA per contiguous page run; no GPU gather/scatter kernel accesses
+        host memory on this path.
+        """
+        if self.layout != "page_first_direct":
+            raise ValueError("direct DMA requires page_first_direct layout")
+        host_cpu = host_indices.cpu()
+        device_cpu = device_indices.cpu()
+        if len(host_cpu) % self.page_size != 0:
+            raise ValueError("direct DMA requires whole pages")
+        for offset in range(0, len(host_cpu), self.page_size):
+            host_page = host_cpu[offset : offset + self.page_size]
+            device_page = device_cpu[offset : offset + self.page_size]
+            host_start = int(host_page[0])
+            device_start = int(device_page[0])
+            expected = torch.arange(self.page_size, dtype=host_page.dtype)
+            if not torch.equal(host_page - host_start, expected) or not torch.equal(
+                device_page - device_start, expected
+            ):
+                raise ValueError("direct DMA requires contiguous page mappings")
+            source_page = host_start // self.page_size
+            device_pool.k_buffer[layer_id][
+                device_start : device_start + self.page_size
+            ].copy_(self.k_buffer[source_page, layer_id], non_blocking=True)
+            device_pool.v_buffer[layer_id][
+                device_start : device_start + self.page_size
+            ].copy_(self.v_buffer[source_page, layer_id], non_blocking=True)
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -475,6 +529,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        if io_backend == "direct_dma":
+            return self.load_to_device_per_layer_dma(
+                device_pool, host_indices, device_indices, layer_id
+            )
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
