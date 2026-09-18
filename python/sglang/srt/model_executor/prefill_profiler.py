@@ -1,8 +1,11 @@
 """Device-side per-layer timing for pure prefill batches."""
 
+import logging
+
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
+logger = logging.getLogger(__name__)
 
 
 class LayerPrefillProfiler:
@@ -48,11 +51,25 @@ class LayerPrefillProfiler:
             end = self.record_prefill_profile_end()
         end.synchronize()
         total_ms = self._start.elapsed_time(end)
-        layer_compute_ms = [
-            (layer_index, start.elapsed_time(stop), 0.0)
-            for layer_index, start, stop in self._layers
-            if stop is not None
-        ]
-        self._start = None
-        self._layers = None
-        return total_ms, layer_compute_ms
+        layer_compute_ms = []
+        try:
+            for layer_index, start, stop in self._layers:
+                if stop is None:
+                    continue
+                try:
+                    elapsed_ms = start.elapsed_time(stop)
+                except (RuntimeError, ValueError) as exc:
+                    # Some backends can invoke module hooks while CUDA graph
+                    # capture/replay owns event recording. Do not terminate the
+                    # scheduler because one layer produced an invalid event pair.
+                    logger.warning(
+                        "Skipping invalid prefill timing events for layer %s: %s",
+                        layer_index,
+                        exc,
+                    )
+                    continue
+                layer_compute_ms.append((layer_index, elapsed_ms, 0.0))
+            return total_ms, layer_compute_ms
+        finally:
+            self._start = None
+            self._layers = None

@@ -120,30 +120,49 @@ class LayerDoneCounter:
         if end is None:
             end = self.record_prefill_profile_end()
         end.synchronize()
-        total_ms = self._prefill_profile_start.elapsed_time(end)
-        wait_ms_by_layer = {}
-        for layer_index, start, stop in self._prefill_profile_waits:
-            wait_ms_by_layer[layer_index] = wait_ms_by_layer.get(
-                layer_index, 0.0
-            ) + start.elapsed_time(stop)
-
-        layer_compute_ms = []
-        for layer_index, start, stop in self._prefill_profile_layers:
-            if stop is None:
-                continue
-            elapsed_ms = start.elapsed_time(stop)
-            layer_wait_ms = wait_ms_by_layer.get(layer_index, 0.0)
-            layer_compute_ms.append(
-                (
-                    layer_index,
-                    max(elapsed_ms - layer_wait_ms, 0.0),
-                    layer_wait_ms,
+        try:
+            total_ms = self._prefill_profile_start.elapsed_time(end)
+            wait_ms_by_layer = {}
+            for layer_index, start, stop in self._prefill_profile_waits:
+                try:
+                    wait_ms = start.elapsed_time(stop)
+                except (RuntimeError, ValueError) as exc:
+                    logger.warning(
+                        "Skipping invalid prefill wait events for layer %s: %s",
+                        layer_index,
+                        exc,
+                    )
+                    continue
+                wait_ms_by_layer[layer_index] = (
+                    wait_ms_by_layer.get(layer_index, 0.0) + wait_ms
                 )
-            )
-        self._prefill_profile_start = None
-        self._prefill_profile_waits = None
-        self._prefill_profile_layers = None
-        return total_ms, layer_compute_ms
+
+            layer_compute_ms = []
+            for layer_index, start, stop in self._prefill_profile_layers:
+                if stop is None:
+                    continue
+                try:
+                    elapsed_ms = start.elapsed_time(stop)
+                except (RuntimeError, ValueError) as exc:
+                    logger.warning(
+                        "Skipping invalid prefill timing events for layer %s: %s",
+                        layer_index,
+                        exc,
+                    )
+                    continue
+                layer_wait_ms = wait_ms_by_layer.get(layer_index, 0.0)
+                layer_compute_ms.append(
+                    (
+                        layer_index,
+                        max(elapsed_ms - layer_wait_ms, 0.0),
+                        layer_wait_ms,
+                    )
+                )
+            return total_ms, layer_compute_ms
+        finally:
+            self._prefill_profile_start = None
+            self._prefill_profile_waits = None
+            self._prefill_profile_layers = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters

@@ -3030,6 +3030,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
+        # Layer hooks record real device events at every module boundary.
+        # Piecewise graph capture/replay can capture those record() calls rather
+        # than recording the Event objects immediately, which makes elapsed_time
+        # reject the pair as unrecorded. Use eager prefill while timing layers.
+        if hasattr(self, "prefill_profiler"):
+            logger.info("Disable piecewise CUDA graphs for prefill layer timing")
+            return
+
         if self.server_args.disable_piecewise_cuda_graph:
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
