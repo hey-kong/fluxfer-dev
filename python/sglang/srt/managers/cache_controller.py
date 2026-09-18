@@ -85,13 +85,21 @@ class LayerDoneCounter:
         self._prefill_profile_layers = []
         self._prefill_profile_start.record()
 
-    def finish_prefill_profile(self):
+    def record_prefill_profile_end(self):
+        """Record the profile end on the caller's current device stream."""
+        if self._prefill_profile_start is None:
+            return None
+        end = device_module.Event(enable_timing=True)
+        end.record()
+        return end
+
+    def finish_prefill_profile(self, end=None):
         """Return device compute time for every layer, excluding loading waits."""
         if self._prefill_profile_start is None:
             return None
 
-        end = device_module.Event(enable_timing=True)
-        end.record()
+        if end is None:
+            end = self.record_prefill_profile_end()
         end.synchronize()
         total_ms = self._prefill_profile_start.elapsed_time(end)
         wait_ms_by_layer = {}

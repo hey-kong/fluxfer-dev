@@ -3496,6 +3496,7 @@ class Scheduler(
 
         # Run forward
         layer_done_counter = None
+        prefill_profile_end = None
         if (
             self.is_generation
             and batch.forward_mode.is_extend()
@@ -3533,6 +3534,13 @@ class Scheduler(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
+                    if layer_done_counter is not None:
+                        # This must be recorded inside forward_stream_ctx. Recording
+                        # it later on the schedule stream does not order it after the
+                        # layer events when overlap scheduling is enabled.
+                        prefill_profile_end = (
+                            layer_done_counter.record_prefill_profile_end()
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -3559,6 +3567,10 @@ class Scheduler(
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                if layer_done_counter is not None:
+                    prefill_profile_end = (
+                        layer_done_counter.record_prefill_profile_end()
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 kwargs = (
@@ -3569,6 +3581,10 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
+                if layer_done_counter is not None:
+                    prefill_profile_end = (
+                        layer_done_counter.record_prefill_profile_end()
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3579,7 +3595,7 @@ class Scheduler(
             batch.output_ids = future_indices_or_next_token_ids
 
             if layer_done_counter is not None:
-                profile = layer_done_counter.finish_prefill_profile()
+                profile = layer_done_counter.finish_prefill_profile(prefill_profile_end)
                 if profile is not None:
                     total_ms, layer_compute_ms = profile
                     new_tokens = sum(
