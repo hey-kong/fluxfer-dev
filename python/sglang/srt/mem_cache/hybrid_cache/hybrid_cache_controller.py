@@ -377,6 +377,9 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            # Sidecar operations have no full-block phase. Allow prefill to
+            # start immediately and retain per-layer readiness waits below.
+            producer_event.complete_preload()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,

@@ -1249,7 +1249,9 @@ class Scheduler(
         if layer_done_counter is None:
             return True
         try:
-            return layer_done_counter.events[consumer_index].finish_event.query()
+            return layer_done_counter.events[
+                consumer_index
+            ].preload_finish_event.query()
         except (AttributeError, IndexError):
             # Be conservative if the counter cannot be inspected: run the
             # prefill and let the model worker perform the normal per-layer wait.

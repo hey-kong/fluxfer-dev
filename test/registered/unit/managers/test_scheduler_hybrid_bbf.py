@@ -88,9 +88,14 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
             def query(self):
                 return self.ready
 
-        def _batch(ready):
+        def _batch(preload_ready, last_layer_ready=False):
             scheduler.tree_cache.cache_controller.layer_done_counter = SimpleNamespace(
-                events=[SimpleNamespace(finish_event=_FinishEvent(ready))]
+                events=[
+                    SimpleNamespace(
+                        preload_finish_event=_FinishEvent(preload_ready),
+                        finish_event=_FinishEvent(last_layer_ready),
+                    )
+                ]
             )
             return SimpleNamespace(
                 hicache_consumer_index=0,
@@ -98,7 +103,11 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
             )
 
         self.assertTrue(scheduler._should_hybrid_bubble_fill_prefill(_batch(False)))
-        self.assertFalse(scheduler._should_hybrid_bubble_fill_prefill(_batch(True)))
+        # Stop bubble filling as soon as full-block preload completes, even
+        # while residual layer-wise transfers are still running.
+        self.assertFalse(
+            scheduler._should_hybrid_bubble_fill_prefill(_batch(True, False))
+        )
 
         scheduler.server_args.enable_hybrid_bubble_filling = False
         self.assertFalse(scheduler._should_hybrid_bubble_fill_prefill(_batch(False)))

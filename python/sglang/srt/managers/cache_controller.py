@@ -54,10 +54,16 @@ class LayerLoadingEvent:
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        # Separately marks the end of the exposed full-block preload. The
+        # layer events continue to protect layer-wise KV readiness.
+        self.preload_finish_event = device_module.Event()
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
+
+    def complete_preload(self):
+        self.preload_finish_event.record()
 
     def wait(self, layer_index: int):
         recorder = getattr(self, "compute_recorder", None)
@@ -1166,6 +1172,11 @@ class HiCacheController:
                 ):
                     hybrid_measurement.full_end.record()
 
+                # Bubble filling covers only the exposed full-block phase.
+                # Prefill may start after this event; its existing per-layer
+                # waits still gate every residual layer-wise transfer.
+                producer_event.complete_preload()
+
                 if tail_host_indices is not None:
                     if hybrid_measurement is not None:
                         hybrid_measurement.layer_bytes = (
@@ -1199,6 +1210,7 @@ class HiCacheController:
                 host_indices, device_indices = self.move_indices(
                     op.host_indices, op.device_indices
                 )
+                producer_event.complete_preload()
                 for i in range(self.layer_num):
                     self.mem_pool_host.load_to_device_per_layer(
                         self.mem_pool_device,
