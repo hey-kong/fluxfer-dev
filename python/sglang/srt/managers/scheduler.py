@@ -3581,25 +3581,29 @@ class Scheduler(
             if layer_done_counter is not None:
                 profile = layer_done_counter.finish_prefill_profile()
                 if profile is not None:
-                    total_ms, layer_wait_ms = profile
-                    compute_ms = max(total_ms - layer_wait_ms, 0.0)
+                    total_ms, layer_compute_ms = profile
                     new_tokens = sum(
                         max(int(getattr(req, "extend_input_len", 0) or 0), 0)
                         for req in batch.reqs
                     )
-                    num_layers = layer_done_counter.num_layers
-                    if new_tokens > 0 and num_layers > 0:
+                    if new_tokens > 0:
+                        for layer_index, compute_ms in layer_compute_ms:
+                            logger.info(
+                                "Prefill layer compute timing: layer=%d, "
+                                "new_tokens=%d, compute_ms=%.3f, "
+                                "compute_us_per_new_token=%.3f "
+                                "(layer-wise loading wait excluded)",
+                                layer_index,
+                                new_tokens,
+                                compute_ms,
+                                compute_ms * 1000 / new_tokens,
+                            )
                         logger.info(
-                            "Prefill compute timing: new_tokens=%d, layers=%d, "
-                            "compute_ms_per_layer=%.3f, "
-                            "compute_us_per_new_token_layer=%.3f "
-                            "(total_device_ms=%.3f, excluded_layer_wait_ms=%.3f)",
+                            "Prefill compute timing complete: new_tokens=%d, "
+                            "profiled_layers=%d, total_device_ms=%.3f",
                             new_tokens,
-                            num_layers,
-                            compute_ms / num_layers,
-                            compute_ms * 1000 / new_tokens / num_layers,
+                            len(layer_compute_ms),
                             total_ms,
-                            layer_wait_ms,
                         )
 
             # These 2 values are needed for processing the output, but the values can be

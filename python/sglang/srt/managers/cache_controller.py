@@ -76,15 +76,17 @@ class LayerDoneCounter:
         self.consumer_index = -1
         self._prefill_profile_start = None
         self._prefill_profile_waits = None
+        self._prefill_profile_layers = None
 
     def start_prefill_profile(self):
         """Start measuring device time, with layer-loading stalls tracked separately."""
         self._prefill_profile_start = device_module.Event(enable_timing=True)
         self._prefill_profile_waits = []
+        self._prefill_profile_layers = []
         self._prefill_profile_start.record()
 
     def finish_prefill_profile(self):
-        """Return (total_ms, layer_wait_ms) for the active prefill profile."""
+        """Return device compute time for every layer, excluding loading waits."""
         if self._prefill_profile_start is None:
             return None
 
@@ -92,12 +94,30 @@ class LayerDoneCounter:
         end.record()
         end.synchronize()
         total_ms = self._prefill_profile_start.elapsed_time(end)
-        wait_ms = sum(
-            start.elapsed_time(stop) for start, stop in self._prefill_profile_waits
-        )
+        wait_ms_by_layer = {}
+        for layer_index, start, stop in self._prefill_profile_waits:
+            wait_ms_by_layer[layer_index] = wait_ms_by_layer.get(
+                layer_index, 0.0
+            ) + start.elapsed_time(stop)
+
+        layer_compute_ms = []
+        for index, (layer_index, start) in enumerate(self._prefill_profile_layers):
+            stop = (
+                self._prefill_profile_layers[index + 1][1]
+                if index + 1 < len(self._prefill_profile_layers)
+                else end
+            )
+            elapsed_ms = start.elapsed_time(stop)
+            layer_compute_ms.append(
+                (
+                    layer_index,
+                    max(elapsed_ms - wait_ms_by_layer.get(layer_index, 0), 0.0),
+                )
+            )
         self._prefill_profile_start = None
         self._prefill_profile_waits = None
-        return total_ms, wait_ms
+        self._prefill_profile_layers = None
+        return total_ms, layer_compute_ms
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -112,23 +132,34 @@ class LayerDoneCounter:
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
-        if self.consumer_index < 0:
-            return
         wait_start = wait_stop = None
         if self._prefill_profile_waits is not None:
             wait_start = device_module.Event(enable_timing=True)
             wait_stop = device_module.Event(enable_timing=True)
             wait_start.record()
+            if (
+                not self._prefill_profile_layers
+                or self._prefill_profile_layers[-1][0] != threshold
+            ):
+                layer_start = (
+                    self._prefill_profile_start
+                    if not self._prefill_profile_layers
+                    else wait_start
+                )
+                self._prefill_profile_layers.append((threshold, layer_start))
+        if self.consumer_index < 0:
+            return
         self.events[self.consumer_index].wait(threshold)
         if wait_stop is not None:
             wait_stop.record()
-            self._prefill_profile_waits.append((wait_start, wait_stop))
+            self._prefill_profile_waits.append((threshold, wait_start, wait_stop))
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
         self._prefill_profile_start = None
         self._prefill_profile_waits = None
+        self._prefill_profile_layers = None
 
 
 class CacheOperation:
