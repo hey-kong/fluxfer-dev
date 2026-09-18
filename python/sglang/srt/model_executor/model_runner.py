@@ -821,10 +821,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
+        self._register_hicache_prefill_timing_hooks()
+
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def _register_hicache_prefill_timing_hooks(self):
+        """Attach exact layer entry/exit markers for hybrid HiCache profiling."""
+        if self.server_args.hicache_io_backend != "hybrid":
+            return
+
+        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+        if counter is None:
+            return
+
+        candidates = [self.model]
+        for _ in range(3):
+            candidates.extend(
+                child
+                for candidate in tuple(candidates)
+                for child in (
+                    getattr(candidate, "model", None),
+                    getattr(candidate, "language_model", None),
+                )
+                if child is not None and child not in candidates
+            )
+        layer_model = next(
+            (candidate for candidate in candidates if hasattr(candidate, "layers")),
+            None,
+        )
+        if layer_model is None:
+            logger.warning(
+                "Cannot register hybrid HiCache prefill timing hooks: "
+                "model has no layers attribute"
+            )
+            return
+
+        for index, layer in enumerate(layer_model.layers):
+            layer_index = getattr(layer, "layer_id", index)
+            layer.register_forward_pre_hook(
+                lambda _module, _inputs, i=layer_index: counter.record_prefill_layer_start(
+                    i
+                )
+            )
+            layer.register_forward_hook(
+                lambda _module, _inputs, _output, i=layer_index: counter.record_prefill_layer_end(
+                    i
+                )
+            )
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:

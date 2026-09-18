@@ -85,6 +85,25 @@ class LayerDoneCounter:
         self._prefill_profile_layers = []
         self._prefill_profile_start.record()
 
+    def record_prefill_layer_start(self, layer_index: int):
+        """Record the exact entry point of a Transformer layer."""
+        if self._prefill_profile_layers is None:
+            return
+        start = device_module.Event(enable_timing=True)
+        start.record()
+        self._prefill_profile_layers.append([layer_index, start, None])
+
+    def record_prefill_layer_end(self, layer_index: int):
+        """Record the exact exit point of a Transformer layer."""
+        if self._prefill_profile_layers is None:
+            return
+        for layer in reversed(self._prefill_profile_layers):
+            if layer[0] == layer_index and layer[2] is None:
+                end = device_module.Event(enable_timing=True)
+                end.record()
+                layer[2] = end
+                return
+
     def record_prefill_profile_end(self):
         """Record the profile end on the caller's current device stream."""
         if self._prefill_profile_start is None:
@@ -109,12 +128,9 @@ class LayerDoneCounter:
             ) + start.elapsed_time(stop)
 
         layer_compute_ms = []
-        for index, (layer_index, start) in enumerate(self._prefill_profile_layers):
-            stop = (
-                self._prefill_profile_layers[index + 1][1]
-                if index + 1 < len(self._prefill_profile_layers)
-                else end
-            )
+        for layer_index, start, stop in self._prefill_profile_layers:
+            if stop is None:
+                continue
             elapsed_ms = start.elapsed_time(stop)
             layer_compute_ms.append(
                 (
@@ -145,16 +161,6 @@ class LayerDoneCounter:
             wait_start = device_module.Event(enable_timing=True)
             wait_stop = device_module.Event(enable_timing=True)
             wait_start.record()
-            if (
-                not self._prefill_profile_layers
-                or self._prefill_profile_layers[-1][0] != threshold
-            ):
-                layer_start = (
-                    self._prefill_profile_start
-                    if not self._prefill_profile_layers
-                    else wait_start
-                )
-                self._prefill_profile_layers.append((threshold, layer_start))
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
