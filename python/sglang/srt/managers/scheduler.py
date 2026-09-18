@@ -259,8 +259,7 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 
-# Balanced Batch Formation for HiCache hybrid I/O.  The ratio mirrors the
-# hybrid H2D preload heuristic in unified_radix_cache.py.
+# Default used when no complete model/hardware hybrid loading profile is supplied.
 HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO = 4.0
 # Hybrid H2D preload should only run when the final prefill batch has enough
 # compute to overlap with the preload phase.
@@ -1143,6 +1142,10 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # Layer timing is always enabled for this build. Mixed chunked prefill
+        # combines prefill and decode in the same kernels, making pure prefill
+        # device time unobservable, so those batches must remain separate.
+        self.enable_prefill_layer_timing = True
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1374,9 +1377,13 @@ class Scheduler(
             return True
         next_load = state.load_tokens + estimate.extra_load_tokens
         next_compute = state.compute_tokens + estimate.compute_tokens
-        return (
-            next_load / max(next_compute, 1) <= HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
+        profile = getattr(self.tree_cache, "hybrid_loading_profile", None)
+        loading_bound_ratio = (
+            profile.overlap_tokens_per_compute_token
+            if profile is not None
+            else HICACHE_HYBRID_BBF_LOADING_BOUND_RATIO
         )
+        return next_load / max(next_compute, 1) <= loading_bound_ratio
 
     @staticmethod
     def _hybrid_bbf_commit_req(
@@ -3331,6 +3338,9 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Per-layer prefill timing must not include decode kernels. Keep the
+            # prefill batch pure instead of turning it into ForwardMode.MIXED.
+            and not self.enable_prefill_layer_timing
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
@@ -3492,6 +3502,26 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # Run forward
+        layer_done_counter = None
+        prefill_profile_end = None
+        if (
+            self.is_generation
+            # MIXED also satisfies is_extend(), but its layer kernels combine
+            # prefill and running decode requests. Their device time cannot be
+            # attributed to prefill tokens alone, so only profile pure prefill.
+            and batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
+        ):
+            cache_controller = getattr(self.tree_cache, "cache_controller", None)
+            candidate = getattr(cache_controller, "layer_done_counter", None)
+            if candidate is None:
+                candidate = getattr(
+                    getattr(self.model_worker, "model_runner", None),
+                    "prefill_profiler",
+                    None,
+                )
+            if candidate is not None:
+                layer_done_counter = candidate
+                layer_done_counter.start_prefill_profile()
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
@@ -3519,6 +3549,13 @@ class Scheduler(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
+                    if layer_done_counter is not None:
+                        # This must be recorded inside forward_stream_ctx. Recording
+                        # it later on the schedule stream does not order it after the
+                        # layer events when overlap scheduling is enabled.
+                        prefill_profile_end = (
+                            layer_done_counter.record_prefill_profile_end()
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -3545,6 +3582,10 @@ class Scheduler(
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                if layer_done_counter is not None:
+                    prefill_profile_end = (
+                        layer_done_counter.record_prefill_profile_end()
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 kwargs = (
@@ -3555,6 +3596,10 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
+                if layer_done_counter is not None:
+                    prefill_profile_end = (
+                        layer_done_counter.record_prefill_profile_end()
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3563,6 +3608,41 @@ class Scheduler(
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
             batch.output_ids = future_indices_or_next_token_ids
+
+            if layer_done_counter is not None:
+                profile = layer_done_counter.finish_prefill_profile(prefill_profile_end)
+                if profile is not None:
+                    total_ms, layer_compute_ms = profile
+                    new_tokens = sum(
+                        max(int(getattr(req, "extend_input_len", 0) or 0), 0)
+                        for req in batch.reqs
+                    )
+                    cached_tokens = sum(
+                        max(int(getattr(req, "cached_tokens", 0) or 0), 0)
+                        for req in batch.reqs
+                    )
+                    if new_tokens > 0:
+                        for layer_index, compute_ms, layer_wait_ms in layer_compute_ms:
+                            logger.info(
+                                "Prefill layer compute timing: layer=%d, "
+                                "new_tokens=%d, excluded_cached_tokens=%d, "
+                                "compute_ms=%.3f, excluded_layer_wait_ms=%.3f, "
+                                "compute_us_per_new_token=%.3f "
+                                "(cached tokens and layer-wise loading wait excluded)",
+                                layer_index,
+                                new_tokens,
+                                cached_tokens,
+                                compute_ms,
+                                layer_wait_ms,
+                                compute_ms * 1000 / new_tokens,
+                            )
+                        logger.info(
+                            "Prefill compute timing complete: new_tokens=%d, "
+                            "profiled_layers=%d, total_device_ms=%.3f",
+                            new_tokens,
+                            len(layer_compute_ms),
+                            total_ms,
+                        )
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that

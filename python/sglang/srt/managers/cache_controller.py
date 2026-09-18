@@ -74,6 +74,95 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self._prefill_profile_start = None
+        self._prefill_profile_waits = None
+        self._prefill_profile_layers = None
+
+    def start_prefill_profile(self):
+        """Start measuring device time, with layer-loading stalls tracked separately."""
+        self._prefill_profile_start = device_module.Event(enable_timing=True)
+        self._prefill_profile_waits = []
+        self._prefill_profile_layers = []
+        self._prefill_profile_start.record()
+
+    def record_prefill_layer_start(self, layer_index: int):
+        """Record the exact entry point of a Transformer layer."""
+        if self._prefill_profile_layers is None:
+            return
+        start = device_module.Event(enable_timing=True)
+        start.record()
+        self._prefill_profile_layers.append([layer_index, start, None])
+
+    def record_prefill_layer_end(self, layer_index: int):
+        """Record the exact exit point of a Transformer layer."""
+        if self._prefill_profile_layers is None:
+            return
+        for layer in reversed(self._prefill_profile_layers):
+            if layer[0] == layer_index and layer[2] is None:
+                end = device_module.Event(enable_timing=True)
+                end.record()
+                layer[2] = end
+                return
+
+    def record_prefill_profile_end(self):
+        """Record the profile end on the caller's current device stream."""
+        if self._prefill_profile_start is None:
+            return None
+        end = device_module.Event(enable_timing=True)
+        end.record()
+        return end
+
+    def finish_prefill_profile(self, end=None):
+        """Return device compute time for every layer, excluding loading waits."""
+        if self._prefill_profile_start is None:
+            return None
+
+        if end is None:
+            end = self.record_prefill_profile_end()
+        end.synchronize()
+        try:
+            total_ms = self._prefill_profile_start.elapsed_time(end)
+            wait_ms_by_layer = {}
+            for layer_index, start, stop in self._prefill_profile_waits:
+                try:
+                    wait_ms = start.elapsed_time(stop)
+                except (RuntimeError, ValueError) as exc:
+                    logger.warning(
+                        "Skipping invalid prefill wait events for layer %s: %s",
+                        layer_index,
+                        exc,
+                    )
+                    continue
+                wait_ms_by_layer[layer_index] = (
+                    wait_ms_by_layer.get(layer_index, 0.0) + wait_ms
+                )
+
+            layer_compute_ms = []
+            for layer_index, start, stop in self._prefill_profile_layers:
+                if stop is None:
+                    continue
+                try:
+                    elapsed_ms = start.elapsed_time(stop)
+                except (RuntimeError, ValueError) as exc:
+                    logger.warning(
+                        "Skipping invalid prefill timing events for layer %s: %s",
+                        layer_index,
+                        exc,
+                    )
+                    continue
+                layer_wait_ms = wait_ms_by_layer.get(layer_index, 0.0)
+                layer_compute_ms.append(
+                    (
+                        layer_index,
+                        max(elapsed_ms - layer_wait_ms, 0.0),
+                        layer_wait_ms,
+                    )
+                )
+            return total_ms, layer_compute_ms
+        finally:
+            self._prefill_profile_start = None
+            self._prefill_profile_waits = None
+            self._prefill_profile_layers = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -88,13 +177,24 @@ class LayerDoneCounter:
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
+        wait_start = wait_stop = None
+        if self._prefill_profile_waits is not None:
+            wait_start = device_module.Event(enable_timing=True)
+            wait_stop = device_module.Event(enable_timing=True)
+            wait_start.record()
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+        if wait_stop is not None:
+            wait_stop.record()
+            self._prefill_profile_waits.append((threshold, wait_start, wait_stop))
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self._prefill_profile_start = None
+        self._prefill_profile_waits = None
+        self._prefill_profile_layers = None
 
 
 class CacheOperation:
