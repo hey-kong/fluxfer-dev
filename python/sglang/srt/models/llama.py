@@ -389,17 +389,30 @@ class LlamaModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
             deferred_norm = None
 
+        recorder = getattr(
+            getattr(forward_batch.token_to_kv_pool, "layer_transfer_counter", None),
+            "compute_recorder",
+            None,
+        )
+        record_prefill = forward_batch.forward_mode.name == "EXTEND"
+        record_for_completion = forward_batch.forward_mode.name in ("EXTEND", "MIXED")
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
+            if recorder is not None and record_for_completion:
+                recorder.begin_layer()
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
+            if recorder is not None and record_for_completion:
+                recorder.end_layer()
+        if recorder is not None and record_for_completion:
+            recorder.finish(update_synopsis=record_prefill)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -564,14 +577,25 @@ class LlamaForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
         # decoder layer
+        recorder = getattr(
+            getattr(forward_batch.token_to_kv_pool, "layer_transfer_counter", None),
+            "compute_recorder",
+            None,
+        )
         for i in range(start, end):
             layer = self.model.layers[i]
+            if recorder is not None:
+                recorder.begin_layer()
             forward_batch.hidden_states, forward_batch.residual = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
                 forward_batch.residual,
             )
+            if recorder is not None:
+                recorder.end_layer()
+        if recorder is not None and end == self.model.config.num_hidden_layers:
+            recorder.finish()
 
         if end == self.model.config.num_hidden_layers:
             # norm

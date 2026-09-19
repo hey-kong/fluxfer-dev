@@ -88,9 +88,14 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
             def query(self):
                 return self.ready
 
-        def _batch(ready):
+        def _batch(preload_ready, last_layer_ready=False):
             scheduler.tree_cache.cache_controller.layer_done_counter = SimpleNamespace(
-                events=[SimpleNamespace(finish_event=_FinishEvent(ready))]
+                events=[
+                    SimpleNamespace(
+                        preload_finish_event=_FinishEvent(preload_ready),
+                        finish_event=_FinishEvent(last_layer_ready),
+                    )
+                ]
             )
             return SimpleNamespace(
                 hicache_consumer_index=0,
@@ -98,7 +103,11 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
             )
 
         self.assertTrue(scheduler._should_hybrid_bubble_fill_prefill(_batch(False)))
-        self.assertFalse(scheduler._should_hybrid_bubble_fill_prefill(_batch(True)))
+        # Stop bubble filling as soon as full-block preload completes, even
+        # while residual layer-wise transfers are still running.
+        self.assertFalse(
+            scheduler._should_hybrid_bubble_fill_prefill(_batch(True, False))
+        )
 
         scheduler.server_args.enable_hybrid_bubble_filling = False
         self.assertFalse(scheduler._should_hybrid_bubble_fill_prefill(_batch(False)))
@@ -116,6 +125,13 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
             SimpleNamespace(h2d_preload_pages=0)
         ]
         self.assertFalse(scheduler._hybrid_prefill_load_queue_has_preload_pages())
+
+    def test_online_batch_tokens_use_current_chunk_and_logical_prefix(self):
+        reqs = [
+            _req(extend_input_len=128, prefix_indices=torch.arange(256)),
+            _req(extend_input_len=32, prefix_indices=torch.arange(64)),
+        ]
+        self.assertEqual(Scheduler._online_hybrid_batch_tokens(reqs), (160, 320))
 
     def test_preload_pages_disabled_for_small_final_compute_batch(self):
         scheduler = self._scheduler(_Node(0))
@@ -289,6 +305,15 @@ class TestHybridBalancedPrefillHelpers(CustomTestCase):
         self.assertTrue(
             scheduler._hybrid_bbf_should_admit(req, adder, state, compute_heavy)
         )
+
+
+class TestHybridHostPoolCompatibility(CustomTestCase):
+    def test_host_pool_group_size_per_token_property(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = SimpleNamespace(size_per_token=4096)
+        self.assertEqual(controller._host_size_per_token(), 4096)
 
 
 if __name__ == "__main__":

@@ -348,6 +348,25 @@ class HybridCacheController(BaseHiCacheController):
     def start_loading(self) -> int:
         if not self.load_queue:
             return -1
+        # The base controller owns the hybrid full-block/layer-wise split and
+        # its timing events. Standard Llama/Mistral KV operations have no
+        # sidecar pool transfers and can use that path directly.
+        if self.io_backend == "hybrid" and all(
+            not op.pool_transfers for op in self.load_queue
+        ):
+            return super().start_loading()
+
+        # Sidecar pools currently retain their established layer-wise path: a
+        # split would also have to partition every PoolTransfer consistently.
+        measurement = self.hybrid_next_measurement
+        self.hybrid_next_measurement = None
+        if measurement is not None:
+            measurement.full_pages = 0
+            measurement.layer_pages = measurement.host_pages
+            measurement.fallback_reason = "sidecar-pools-layer-wise-unmeasured"
+            self.hybrid_pending_measurements.append(measurement)
+        for op in self.load_queue:
+            op.h2d_preload_pages = 0
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
@@ -358,6 +377,9 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            # Sidecar operations have no full-block phase. Allow prefill to
+            # start immediately and retain per-layer readiness waits below.
+            producer_event.complete_preload()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,

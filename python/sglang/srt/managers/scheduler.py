@@ -187,6 +187,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.online_prefill_cost import supports_online_prefill_cost
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -1219,6 +1220,13 @@ class Scheduler(
             op.h2d_preload_pages = 0
 
     @staticmethod
+    def _online_hybrid_batch_tokens(can_run_list: List[Req]) -> Tuple[int, int]:
+        """Return token-weighted (new-token Q, cached-token H) for this chunk."""
+        q = sum(max(int(req.extend_input_len), 0) for req in can_run_list)
+        h = sum(len(req.prefix_indices) for req in can_run_list)
+        return q, h
+
+    @staticmethod
     def _hybrid_prefill_batch_compute_tokens(can_run_list: List[Req]) -> int:
         return sum(
             max(int(getattr(req, "extend_input_len", 0) or 0), 0)
@@ -1241,7 +1249,9 @@ class Scheduler(
         if layer_done_counter is None:
             return True
         try:
-            return layer_done_counter.events[consumer_index].finish_event.query()
+            return layer_done_counter.events[
+                consumer_index
+            ].preload_finish_event.query()
         except (AttributeError, IndexError):
             # Be conservative if the counter cannot be inspected: run the
             # prefill and let the model worker perform the normal per-layer wait.
@@ -1975,10 +1985,22 @@ class Scheduler(
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
+    def _collect_online_hybrid_stats(self) -> None:
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        # Publish immutable compute-completion flags before transfer samples
+        # consume them in the same scheduler iteration.
+        recorder = getattr(cache_controller, "prefill_compute_recorder", None)
+        if recorder is not None:
+            recorder.collect()
+        collect = getattr(cache_controller, "collect_hybrid_measurements", None)
+        if collect is not None:
+            collect()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            self._collect_online_hybrid_stats()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2015,6 +2037,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            self._collect_online_hybrid_stats()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -3294,9 +3317,32 @@ class Scheduler(
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            if not self._should_hybrid_prefill_preload_batch(can_run_list):
-                self._disable_hybrid_prefill_preload_pages()
+            # Assign one shared hybrid-loading budget after chunking and batch
+            # formation have fixed this iteration's logical work.
+            cache_controller = getattr(self.tree_cache, "cache_controller", None)
+            if (
+                getattr(cache_controller, "io_backend", None) == "hybrid"
+                and hasattr(cache_controller, "prepare_online_hybrid_batch")
+            ):
+                architectures = getattr(self.model_config.hf_config, "architectures", ())
+                architecture = architectures[0] if architectures else ""
+                cache_controller.online_prefill_compute_supported = (
+                    supports_online_prefill_cost(architecture)
+                )
+                q, h = self._online_hybrid_batch_tokens(can_run_list)
+                will_mix_decode = (
+                    self.is_mixed_chunk
+                    and not self.running_batch.is_empty()
+                    and not (
+                        new_batch.return_logprob or self.running_batch.return_logprob
+                    )
+                    and new_batch.input_embeds is None
+                )
+                cache_controller.prepare_online_hybrid_batch(
+                    q,
+                    h,
+                    "mixed-prefill-decode" if will_mix_decode else None,
+                )
             hybrid_preload_pages_pending = (
                 self._is_hybrid_bubble_filling_enabled()
                 and self._hybrid_prefill_load_queue_has_preload_pages()

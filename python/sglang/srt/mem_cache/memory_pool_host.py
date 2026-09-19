@@ -430,9 +430,30 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=device,
         )
         staged_v = torch.empty_like(staged_k)
-        for dst_page, src_page in enumerate(page_ids):
-            staged_k[dst_page].copy_(self.k_buffer[src_page], non_blocking=True)
-            staged_v[dst_page].copy_(self.v_buffer[src_page], non_blocking=True)
+        # Coalesce adjacent host pages into large cudaMemcpyAsync operations.
+        # The previous one-copy-per-page loop made full-block transfer dominated
+        # by launch overhead for small pages.
+        run_dst = 0
+        run_src = page_ids[0]
+        run_length = 1
+        for dst_page in range(1, num_pages + 1):
+            extends_run = (
+                dst_page < num_pages
+                and page_ids[dst_page] == run_src + run_length
+            )
+            if extends_run:
+                run_length += 1
+                continue
+            staged_k[run_dst : run_dst + run_length].copy_(
+                self.k_buffer[run_src : run_src + run_length], non_blocking=True
+            )
+            staged_v[run_dst : run_dst + run_length].copy_(
+                self.v_buffer[run_src : run_src + run_length], non_blocking=True
+            )
+            if dst_page < num_pages:
+                run_dst = dst_page
+                run_src = page_ids[dst_page]
+                run_length = 1
 
         staged_indices = torch.arange(
             num_pages * self.page_size, dtype=torch.int64, device=device

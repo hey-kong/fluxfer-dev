@@ -324,6 +324,11 @@ class UnifiedRadixCache(BasePrefixCache):
             attn_tp_group=params.attn_tp_cache_group,
         )
 
+        if self.cache_controller.io_backend == "hybrid":
+            self.cache_controller.init_online_hybrid_loading(
+                server_args.max_prefill_tokens
+            )
+
         # State initialization
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -1346,18 +1351,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        compute_tokens = max(req.extend_input_len - host_tokens, 0)
-        total_pages = (host_tokens + self.page_size - 1) // self.page_size
-        if compute_tokens == 0:
-            return total_pages
-
-        max_overlap_tokens = 4 * compute_tokens
-        if host_tokens <= max_overlap_tokens:
-            return 0
-
-        preload_tokens = host_tokens - max_overlap_tokens
-        preload_pages = (preload_tokens + self.page_size - 1) // self.page_size
-        return min(max(preload_pages, 0), total_pages)
+        # The batch-level budget is assigned after scheduling has finalized the
+        # complete prefill batch. Cold-start operations remain layer-wise.
+        return 0
 
     def load_back(
         self,

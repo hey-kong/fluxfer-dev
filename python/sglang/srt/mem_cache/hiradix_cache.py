@@ -153,6 +153,11 @@ class HiRadixCache(RadixCache):
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
+        if self.cache_controller.io_backend == "hybrid":
+            self.cache_controller.init_online_hybrid_loading(
+                server_args.max_prefill_tokens
+            )
+
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
