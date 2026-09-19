@@ -46,6 +46,7 @@ class CacheOperation(BaseCacheOperation):
         priority: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         h2d_preload_pages: int = 0,
+        admission_nodes: Optional[list] = None,
     ):
         super().__init__(
             host_indices,
@@ -53,6 +54,7 @@ class CacheOperation(BaseCacheOperation):
             node_id,
             priority,
             h2d_preload_pages=h2d_preload_pages,
+            admission_nodes=admission_nodes,
         )
         self.pool_transfers = pool_transfers
 
@@ -303,6 +305,7 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
         h2d_preload_pages: int = 0,
+        admission_nodes: Optional[list] = None,
     ) -> Optional[torch.Tensor]:
         if h2d_preload_pages:
             raise ValueError(
@@ -341,6 +344,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                admission_nodes=admission_nodes,
             )
         )
         return device_indices

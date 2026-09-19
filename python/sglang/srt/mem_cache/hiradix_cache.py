@@ -179,7 +179,7 @@ class HiRadixCache(RadixCache):
         # aggressively demotes selected device-resident nodes back to DRAM-only.
         self.hybrid_pending_device_demotions = set()
         self.hybrid_write_demote_node_ids = set()
-        self.hybrid_load_back_nodes_by_reqid: dict[str, list[TreeNode]] = {}
+        self.hybrid_admission_ops_by_reqid: dict[str, list] = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -649,7 +649,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.hybrid_pending_device_demotions.clear()
         self.hybrid_write_demote_node_ids.clear()
-        self.hybrid_load_back_nodes_by_reqid.clear()
+        self.hybrid_admission_ops_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -715,21 +715,26 @@ class HiRadixCache(RadixCache):
         for node in list(self.hybrid_pending_device_demotions):
             self._try_hybrid_demote_device_node(node)
 
-    def _select_hybrid_load_back_tail_nodes(
-        self, nodes: List[TreeNode]
-    ) -> List[TreeNode]:
-        total_pages = sum(len(node.value) // self.page_size for node in nodes)
-        keep_pages = (total_pages + 1) // 2
-        tail_nodes = []
-        page_offset = 0
-        for node in nodes:
-            node_pages = len(node.value) // self.page_size
-            node_start = page_offset
-            node_end = page_offset + node_pages
-            if keep_pages <= node_start and node_end <= total_pages:
-                tail_nodes.append(node)
-            page_offset = node_end
-        return tail_nodes
+    def _record_request_prefix_hits(self, req, last_match_node: TreeNode) -> None:
+        """Count the matched path once per request and snapshot its threshold."""
+        if req is None or last_match_node is self.root_node:
+            return
+        seen = getattr(req, "hicache_prefix_hit_node_ids", None)
+        if seen is None:
+            seen = set()
+            req.hicache_prefix_hit_node_ids = seen
+        path = []
+        node = last_match_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        for node in path:
+            if node.id not in seen:
+                node.prefix_hit_count += 1
+                seen.add(node.id)
+        if not hasattr(req, "hicache_admission_threshold"):
+            req.hicache_admission_threshold = path[-1].prefix_hit_count
 
     def _mark_hybrid_generated_node_for_demotion(self, node: TreeNode) -> None:
         if not self._is_hybrid_write_through_mode():
@@ -743,19 +748,21 @@ class HiRadixCache(RadixCache):
             # Fresh pages are demoted only after their write-through DMA ACKs.
             node.hicache_demote_after_write = True
 
-    def _record_hybrid_load_back_nodes(
-        self, req, nodes_to_load: List[TreeNode]
-    ) -> None:
+    def _record_hybrid_admission_operation(self, req, operation) -> None:
         if (
             req is None
             or not self._is_hybrid_write_through_mode()
-            or len(nodes_to_load) == 0
+            or operation is None
+            or not operation.admission_nodes
         ):
             return
         rid = getattr(req, "rid", None)
         if rid is None:
             return
-        self.hybrid_load_back_nodes_by_reqid.setdefault(rid, []).extend(nodes_to_load)
+        threshold = getattr(req, "hicache_admission_threshold", 0)
+        self.hybrid_admission_ops_by_reqid.setdefault(rid, []).append(
+            (operation, threshold)
+        )
 
     def _demote_hybrid_load_back_tail_for_req(self, req) -> None:
         if req is None:
@@ -763,16 +770,24 @@ class HiRadixCache(RadixCache):
         rid = getattr(req, "rid", None)
         if rid is None:
             return
-        nodes = self.hybrid_load_back_nodes_by_reqid.pop(rid, [])
-        if not nodes:
-            return
+        records = self.hybrid_admission_ops_by_reqid.pop(rid, [])
         seen = set()
-        ordered_nodes = []
-        for node in nodes:
-            if node not in seen and not node.evicted:
-                ordered_nodes.append(node)
-                seen.add(node)
-        for node in self._select_hybrid_load_back_tail_nodes(ordered_nodes):
+        demote_nodes = []
+        for operation, threshold in records:
+            preload_tokens = operation.h2d_preload_pages * self.page_size
+            offset = 0
+            for node in operation.admission_nodes:
+                node_tokens = len(node.value) if node.value is not None else 0
+                loaded_full_block = offset < preload_tokens
+                offset += node_tokens
+                if node.id in seen or node.evicted:
+                    continue
+                seen.add(node.id)
+                if node.prefix_hit_count > threshold or loaded_full_block:
+                    continue
+                demote_nodes.append(node)
+        # Preserve the contiguous HBM prefix invariant by releasing leaves first.
+        for node in reversed(demote_nodes):
             self._try_hybrid_demote_device_node(node)
 
     def _hybrid_write_through_cache_len(self, req, token_len: int) -> int:
@@ -1296,6 +1311,7 @@ class HiRadixCache(RadixCache):
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
+            admission_nodes=nodes_to_load,
             **self._get_extra_pools(),
         )
         if device_indices is None:
@@ -1303,6 +1319,7 @@ class HiRadixCache(RadixCache):
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
+                admission_nodes=nodes_to_load,
                 **self._get_extra_pools(),
             )
         self.dec_lock_ref(ancester_node)
@@ -1317,8 +1334,13 @@ class HiRadixCache(RadixCache):
             )
             return None
 
+        admission_operation = (
+            self.cache_controller.load_queue[-1]
+            if self.cache_controller.io_backend == "hybrid"
+            else None
+        )
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
-        self._record_hybrid_load_back_nodes(req, nodes_to_load)
+        self._record_hybrid_admission_operation(req, admission_operation)
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
@@ -1538,6 +1560,7 @@ class HiRadixCache(RadixCache):
             return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
+        self._record_request_prefix_hits(params.req, last_node)
         if value:
             value = torch.cat(value)
         else:
@@ -1695,6 +1718,7 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.prefix_hit_count = child.prefix_hit_count
 
         # split value and host value if exists
         if child.evicted:
@@ -1810,7 +1834,7 @@ class HiRadixCache(RadixCache):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
-        self.hybrid_load_back_nodes_by_reqid.pop(rid, None)
+        self.hybrid_admission_ops_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 

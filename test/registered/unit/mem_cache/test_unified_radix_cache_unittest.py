@@ -2,6 +2,7 @@
 
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -9,6 +10,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1483,6 +1485,52 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(tree.full_evictable_size(), 0)
         self.assertIn(node, tree.evictable_host_leaves)
         tree.sanity_check()
+
+    def test_hybrid_prefix_frequency_counts_once_per_request(self):
+        components = (ComponentType.FULL,)
+        root = UnifiedTreeNode(components)
+        first = UnifiedTreeNode(components)
+        leaf = UnifiedTreeNode(components)
+        first.parent = root
+        leaf.parent = first
+        tree = SimpleNamespace(root_node=root)
+        req = SimpleNamespace()
+
+        UnifiedRadixCache._record_request_prefix_hits(tree, req, leaf)
+        UnifiedRadixCache._record_request_prefix_hits(tree, req, leaf)
+
+        self.assertEqual(first.prefix_hit_count, 1)
+        self.assertEqual(leaf.prefix_hit_count, 1)
+        self.assertEqual(req.hicache_admission_threshold, 1)
+
+    def test_hybrid_admission_uses_frequency_and_full_block(self):
+        components = (ComponentType.FULL,)
+        root = UnifiedTreeNode(components)
+        nodes = [UnifiedTreeNode(components) for _ in range(3)]
+        parent = root
+        for node in nodes:
+            node.parent = parent
+            parent.children[node.id] = node
+            node.component_data[ComponentType.FULL].value = torch.tensor([node.id])
+            parent = node
+        nodes[0].prefix_hit_count = 2
+        nodes[1].prefix_hit_count = 3
+        nodes[2].prefix_hit_count = 2
+        operation = CacheOperation(
+            torch.arange(3), torch.arange(3), nodes[-1].id,
+            h2d_preload_pages=1, admission_nodes=nodes,
+        )
+        req = SimpleNamespace(rid="request", hicache_admission_threshold=2)
+        demoted = []
+        tree = SimpleNamespace(
+            root_node=root, page_size=1,
+            hybrid_admission_ops_by_reqid={"request": [(operation, 2)]},
+            _try_hybrid_demote_device_node=demoted.append,
+        )
+
+        UnifiedRadixCache._demote_hybrid_load_back_tail_for_req(tree, req)
+
+        self.assertEqual(demoted, [nodes[2]])
 
     def test_hicache_match_through_evicted_node(self):
         """Match can traverse evicted (S3) nodes using host_value."""

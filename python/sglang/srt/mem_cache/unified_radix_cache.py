@@ -64,6 +64,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.hash_value = None
         self.hit_count = 0
+        # Request-level prefix-hit frequency across both HBM and DRAM.
+        self.prefix_hit_count = 0
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )
@@ -278,7 +280,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.hybrid_pending_device_demotions: set[UnifiedTreeNode] = set()
         self.hybrid_write_demote_node_ids: set[int] = set()
-        self.hybrid_load_back_nodes_by_reqid: dict[str, list[UnifiedTreeNode]] = {}
+        self.hybrid_admission_ops_by_reqid: dict[str, list] = {}
         self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
@@ -472,34 +474,32 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self._is_hybrid_write_through_mode():
             self.hybrid_pending_device_demotions.clear()
             self.hybrid_write_demote_node_ids.clear()
-            self.hybrid_load_back_nodes_by_reqid.clear()
+            self.hybrid_admission_ops_by_reqid.clear()
             return
 
         for node in list(self.hybrid_pending_device_demotions):
             self._try_hybrid_demote_device_node(node)
 
-    def _select_hybrid_load_back_tail_nodes(
-        self, nodes: list[UnifiedTreeNode]
-    ) -> list[UnifiedTreeNode]:
-        total_pages = sum(
-            len(node.component_data[BASE_COMPONENT_TYPE].value) // self.page_size
-            for node in nodes
-            if node.component_data[BASE_COMPONENT_TYPE].value is not None
-        )
-        keep_pages = (total_pages + 1) // 2
-        tail_nodes: list[UnifiedTreeNode] = []
-        page_offset = 0
-        for node in nodes:
-            value = node.component_data[BASE_COMPONENT_TYPE].value
-            if value is None:
-                continue
-            node_pages = len(value) // self.page_size
-            node_start = page_offset
-            node_end = page_offset + node_pages
-            if keep_pages <= node_start and node_end <= total_pages:
-                tail_nodes.append(node)
-            page_offset = node_end
-        return tail_nodes
+    def _record_request_prefix_hits(self, req, best_match_node) -> None:
+        """Count matched pages once per request and snapshot the admission threshold."""
+        if req is None or best_match_node is self.root_node:
+            return
+        seen = getattr(req, "hicache_prefix_hit_node_ids", None)
+        if seen is None:
+            seen = set()
+            req.hicache_prefix_hit_node_ids = seen
+        path = []
+        node = best_match_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        for node in path:
+            if node.id not in seen:
+                node.prefix_hit_count += 1
+                seen.add(node.id)
+        if not hasattr(req, "hicache_admission_threshold"):
+            req.hicache_admission_threshold = path[-1].prefix_hit_count
 
     def _mark_hybrid_generated_node_for_demotion(self, node: UnifiedTreeNode) -> None:
         if not self._is_hybrid_write_through_mode():
@@ -512,19 +512,21 @@ class UnifiedRadixCache(BasePrefixCache):
             # Fresh pages are demoted only after their write-through DMA ACKs.
             node.hicache_demote_after_write = True
 
-    def _record_hybrid_load_back_nodes(
-        self, req, nodes_to_load: list[UnifiedTreeNode]
-    ) -> None:
+    def _record_hybrid_admission_operation(self, req, operation) -> None:
         if (
             req is None
             or not self._is_hybrid_write_through_mode()
-            or len(nodes_to_load) == 0
+            or operation is None
+            or not operation.admission_nodes
         ):
             return
         rid = getattr(req, "rid", None)
         if rid is None:
             return
-        self.hybrid_load_back_nodes_by_reqid.setdefault(rid, []).extend(nodes_to_load)
+        threshold = getattr(req, "hicache_admission_threshold", 0)
+        self.hybrid_admission_ops_by_reqid.setdefault(rid, []).append(
+            (operation, threshold)
+        )
 
     def _demote_hybrid_load_back_tail_for_req(self, req) -> None:
         if req is None:
@@ -532,16 +534,25 @@ class UnifiedRadixCache(BasePrefixCache):
         rid = getattr(req, "rid", None)
         if rid is None:
             return
-        nodes = self.hybrid_load_back_nodes_by_reqid.pop(rid, [])
-        if not nodes:
-            return
+        records = self.hybrid_admission_ops_by_reqid.pop(rid, [])
         seen = set()
-        ordered_nodes: list[UnifiedTreeNode] = []
-        for node in nodes:
-            if node not in seen and not node.evicted:
-                ordered_nodes.append(node)
-                seen.add(node)
-        for node in self._select_hybrid_load_back_tail_nodes(ordered_nodes):
+        demote_nodes = []
+        for operation, threshold in records:
+            preload_tokens = operation.h2d_preload_pages * self.page_size
+            offset = 0
+            for node in operation.admission_nodes:
+                value = node.component_data[BASE_COMPONENT_TYPE].value
+                node_tokens = len(value) if value is not None else 0
+                loaded_full_block = offset < preload_tokens
+                offset += node_tokens
+                if node.id in seen or node.evicted:
+                    continue
+                seen.add(node.id)
+                if node.prefix_hit_count > threshold or loaded_full_block:
+                    continue
+                demote_nodes.append(node)
+        # Preserve a contiguous HBM prefix by releasing descendants first.
+        for node in reversed(demote_nodes):
             self._try_hybrid_demote_device_node(node)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
@@ -801,6 +812,7 @@ class UnifiedRadixCache(BasePrefixCache):
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
     ) -> MatchResult:
+        self._record_request_prefix_hits(params.req, best_match_node)
         node_update = best_match_node
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1415,6 +1427,13 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
             h2d_preload_pages=h2d_preload_pages,
+            admission_nodes=kv_xfer.nodes_to_load or [],
+        )
+        admission_operation = (
+            self.cache_controller.load_queue[-1]
+            if device_indices is not None
+            and self.cache_controller.io_backend == "hybrid"
+            else None
         )
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
@@ -1436,7 +1455,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
-        self._record_hybrid_load_back_nodes(req, kv_xfer.nodes_to_load or [])
+        self._record_hybrid_admission_operation(req, admission_operation)
         self.ongoing_load_back[best_match_node.id] = (
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
