@@ -987,10 +987,7 @@ class HiCacheController:
         return measurement
 
     def collect_hybrid_measurements(self) -> None:
-        from sglang.srt.mem_cache.online_prefill_cost import (
-            TransferSample,
-            should_log_hybrid_batch,
-        )
+        from sglang.srt.mem_cache.online_prefill_cost import TransferSample
 
         remaining = []
         for item in self.hybrid_pending_measurements:
@@ -1008,42 +1005,18 @@ class HiCacheController:
             if any(not event.query() for event in events):
                 remaining.append(item)
                 continue
-            reasons = []
-            full_bw = None
-            layer_bw = None
             if item.full_end is not None:
                 elapsed = item.full_start.elapsed_time(item.full_end) / 1000.0
-                if self.hybrid_transfer_samples.update(
+                self.hybrid_transfer_samples.update(
                     "full_block", TransferSample(item.sequence, item.full_bytes, elapsed)
-                ):
-                    full_bw = TransferSample(item.sequence, item.full_bytes, elapsed).bandwidth_gbps
-                else:
-                    reasons.append("invalid-full-block-measurement")
+                )
             if item.layer_event_pairs:
                 elapsed = sum(
                     start.elapsed_time(end)
                     for start, end in item.layer_event_pairs
                 ) / 1000.0
-                if self.hybrid_transfer_samples.update(
+                self.hybrid_transfer_samples.update(
                     "layer_wise", TransferSample(item.sequence, item.layer_bytes, elapsed)
-                ):
-                    layer_bw = TransferSample(
-                        item.sequence, item.layer_bytes, elapsed
-                    ).bandwidth_gbps
-                else:
-                    reasons.append("invalid-layer-wise-measurement")
-            if should_log_hybrid_batch(item.host_pages):
-                reason = item.fallback_reason or (
-                    ",".join(reasons) if reasons else "none"
-                )
-                logger.info(
-                    "Hybrid KV batch=%d rank=%d Q=%d H=%d N=%d full_pages=%d layer_pages=%d full_GBps=%s layer_GBps=%s estimated_preload_ms=%s fallback=%s",
-                    item.sequence, get_tensor_model_parallel_rank(), item.q, item.h,
-                    item.host_pages, item.full_pages, item.layer_pages,
-                    "N/A" if full_bw is None else f"{full_bw:.3f}",
-                    "N/A" if layer_bw is None else f"{layer_bw:.3f}",
-                    "N/A" if item.estimated_preload_seconds is None else f"{item.estimated_preload_seconds * 1000:.3f}",
-                    reason,
                 )
             if item.full_start is not None:
                 self.hybrid_timing_event_pairs.release(

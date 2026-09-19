@@ -7,7 +7,6 @@ from sglang.srt.mem_cache.online_prefill_cost import (
     TransferSample,
     select_batch_split,
     select_fixed_ratio_split,
-    should_log_hybrid_batch,
     supports_online_prefill_cost,
 )
 
@@ -158,8 +157,3 @@ def test_completion_callback_precedes_event_reuse():
     recorder.collect()
     assert completions == [11]
     assert pair in recorder.event_pairs.free
-
-
-def test_no_host_pages_suppress_transfer_summary():
-    assert not should_log_hybrid_batch(0)
-    assert should_log_hybrid_batch(1)
