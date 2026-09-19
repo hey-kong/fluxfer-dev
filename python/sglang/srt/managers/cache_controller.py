@@ -981,7 +981,10 @@ class HiCacheController:
         return measurement
 
     def collect_hybrid_measurements(self) -> None:
-        from sglang.srt.mem_cache.online_prefill_cost import TransferSample
+        from sglang.srt.mem_cache.online_prefill_cost import (
+            TransferSample,
+            should_log_hybrid_batch,
+        )
 
         remaining = []
         for item in self.hybrid_pending_measurements:
@@ -1023,16 +1026,19 @@ class HiCacheController:
                     ).bandwidth_gbps
                 else:
                     reasons.append("invalid-layer-wise-measurement")
-            reason = item.fallback_reason or (",".join(reasons) if reasons else "none")
-            logger.info(
-                "Hybrid KV batch=%d rank=%d Q=%d H=%d N=%d full_pages=%d layer_pages=%d full_GBps=%s layer_GBps=%s estimated_preload_ms=%s fallback=%s",
-                item.sequence, get_tensor_model_parallel_rank(), item.q, item.h,
-                item.host_pages, item.full_pages, item.layer_pages,
-                "N/A" if full_bw is None else f"{full_bw:.3f}",
-                "N/A" if layer_bw is None else f"{layer_bw:.3f}",
-                "N/A" if item.estimated_preload_seconds is None else f"{item.estimated_preload_seconds * 1000:.3f}",
-                reason,
-            )
+            if should_log_hybrid_batch(item.host_pages):
+                reason = item.fallback_reason or (
+                    ",".join(reasons) if reasons else "none"
+                )
+                logger.info(
+                    "Hybrid KV batch=%d rank=%d Q=%d H=%d N=%d full_pages=%d layer_pages=%d full_GBps=%s layer_GBps=%s estimated_preload_ms=%s fallback=%s",
+                    item.sequence, get_tensor_model_parallel_rank(), item.q, item.h,
+                    item.host_pages, item.full_pages, item.layer_pages,
+                    "N/A" if full_bw is None else f"{full_bw:.3f}",
+                    "N/A" if layer_bw is None else f"{layer_bw:.3f}",
+                    "N/A" if item.estimated_preload_seconds is None else f"{item.estimated_preload_seconds * 1000:.3f}",
+                    reason,
+                )
             if item.full_start is not None:
                 self.hybrid_timing_event_pairs.release(
                     (item.full_start, item.full_end)
@@ -1193,7 +1199,7 @@ class HiCacheController:
                             tail_host_indices,
                             tail_device_indices,
                             i,
-                            "direct_dma",
+                            "direct",
                         )
                         if self.has_draft and i < self.mem_pool_host_draft.layer_num:
                             self.mem_pool_host_draft.load_to_device_per_layer(
@@ -1201,7 +1207,7 @@ class HiCacheController:
                                 tail_host_indices,
                                 tail_device_indices,
                                 i,
-                                "direct_dma",
+                                "direct",
                             )
                         if timing_pair is not None:
                             timing_pair[1].record()

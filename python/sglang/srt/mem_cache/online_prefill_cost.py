@@ -116,6 +116,11 @@ class LatestTransferSamples:
         return True
 
 
+def should_log_hybrid_batch(host_pages: int) -> bool:
+    """Suppress transfer summaries when the batch performed no Host H2D work."""
+    return host_pages > 0
+
+
 def select_fixed_ratio_split(
     host_pages: int, page_size: int, compute_tokens: int, ratio: float = 4.0
 ) -> tuple[int, int]:

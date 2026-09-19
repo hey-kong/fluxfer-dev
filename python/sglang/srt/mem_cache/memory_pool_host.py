@@ -488,39 +488,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             block_quota=1,
         )
 
-    def load_to_device_per_layer_dma(
-        self, device_pool, host_indices, device_indices, layer_id
-    ):
-        """Copy one layer with cudaMemcpyAsync, without a transfer kernel.
-
-        Page allocations are contiguous within each page. We deliberately issue
-        one DMA per contiguous page run; no GPU gather/scatter kernel accesses
-        host memory on this path.
-        """
-        if self.layout != "page_first_direct":
-            raise ValueError("direct DMA requires page_first_direct layout")
-        host_cpu = host_indices.cpu()
-        device_cpu = device_indices.cpu()
-        if len(host_cpu) % self.page_size != 0:
-            raise ValueError("direct DMA requires whole pages")
-        for offset in range(0, len(host_cpu), self.page_size):
-            host_page = host_cpu[offset : offset + self.page_size]
-            device_page = device_cpu[offset : offset + self.page_size]
-            host_start = int(host_page[0])
-            device_start = int(device_page[0])
-            expected = torch.arange(self.page_size, dtype=host_page.dtype)
-            if not torch.equal(host_page - host_start, expected) or not torch.equal(
-                device_page - device_start, expected
-            ):
-                raise ValueError("direct DMA requires contiguous page mappings")
-            source_page = host_start // self.page_size
-            device_pool.k_buffer[layer_id][
-                device_start : device_start + self.page_size
-            ].copy_(self.k_buffer[source_page, layer_id], non_blocking=True)
-            device_pool.v_buffer[layer_id][
-                device_start : device_start + self.page_size
-            ].copy_(self.v_buffer[source_page, layer_id], non_blocking=True)
-
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -529,10 +496,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
-        if io_backend == "direct_dma":
-            return self.load_to_device_per_layer_dma(
-                device_pool, host_indices, device_indices, layer_id
-            )
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
