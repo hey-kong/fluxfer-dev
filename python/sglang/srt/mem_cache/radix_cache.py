@@ -217,6 +217,9 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        # Request-level prefix frequency used by hybrid HBM admission.  This is
+        # distinct from hit_count, whose semantics also drive write-through.
+        self.prefix_hit_count = 0
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0

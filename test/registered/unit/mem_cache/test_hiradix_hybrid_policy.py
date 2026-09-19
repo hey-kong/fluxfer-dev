@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
@@ -17,22 +18,46 @@ class TestHiRadixHybridWriteThroughPolicy(unittest.TestCase):
         node.value = torch.arange(pages * page_size, dtype=torch.int64)
         return node
 
-    def _selected_pages(self, page_counts: list[int]) -> list[int]:
+    def test_prefix_frequency_counts_hbm_and_dram_once_per_request(self):
+        cache = object.__new__(HiRadixCache)
+        cache.root_node = TreeNode()
+        hbm_node = self._node(1, 4)
+        dram_node = self._node(1, 4)
+        hbm_node.parent = cache.root_node
+        dram_node.parent = hbm_node
+        dram_node.host_value = dram_node.value
+        dram_node.value = None
+        req = SimpleNamespace()
+
+        cache._record_request_prefix_hits(req, dram_node)
+        cache._record_request_prefix_hits(req, dram_node)
+
+        self.assertEqual(hbm_node.prefix_hit_count, 1)
+        self.assertEqual(dram_node.prefix_hit_count, 1)
+        self.assertEqual(req.hicache_admission_threshold, 1)
+
+    def test_admission_uses_frequency_and_full_block(self):
         page_size = 4
         cache = object.__new__(HiRadixCache)
         cache.page_size = page_size
-        nodes = [self._node(pages, page_size) for pages in page_counts]
-        selected = cache._select_hybrid_load_back_tail_nodes(nodes)
-        return [len(node.value) // page_size for node in selected]
+        cache.hybrid_admission_ops_by_reqid = {}
+        nodes = [self._node(1, page_size) for _ in range(3)]
+        for frequency, node in zip((2, 3, 2), nodes):
+            node.prefix_hit_count = frequency
+        operation = CacheOperation(
+            torch.arange(12),
+            torch.arange(12),
+            nodes[-1].id,
+            h2d_preload_pages=1,
+            admission_nodes=nodes,
+        )
+        cache.hybrid_admission_ops_by_reqid["request"] = [(operation, 2)]
+        demoted = []
+        cache._try_hybrid_demote_device_node = demoted.append
 
-    def test_tail_demotion_keeps_crossing_node_for_two_plus_four_pages(self):
-        self.assertEqual(self._selected_pages([2, 4]), [])
+        cache._demote_hybrid_load_back_tail_for_req(SimpleNamespace(rid="request"))
 
-    def test_tail_demotion_exact_half_for_two_plus_one_plus_three_pages(self):
-        self.assertEqual(self._selected_pages([2, 1, 3]), [3])
-
-    def test_tail_demotion_best_effort_for_two_plus_two_plus_two_pages(self):
-        self.assertEqual(self._selected_pages([2, 2, 2]), [2])
+        self.assertEqual(demoted, [nodes[2]])
 
     def test_generated_node_final_state_is_dram_only_after_pending_drain(self):
         page_size = 4
