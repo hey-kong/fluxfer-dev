@@ -142,12 +142,16 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
         h2d_preload_pages: int = 0,
+        admission_nodes: Optional[list] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
         self.h2d_preload_pages = h2d_preload_pages
+        # Root-to-leaf radix nodes covered by this operation. The controller
+        # keeps this opaque metadata until the batch split has been assigned.
+        self.admission_nodes = admission_nodes or []
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -799,6 +803,7 @@ class HiCacheController:
         node_id: int = -1,
         extra_pools: Optional[list] = None,
         h2d_preload_pages: int = 0,
+        admission_nodes: Optional[list] = None,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
@@ -815,6 +820,7 @@ class HiCacheController:
                 node_id,
                 priority,
                 h2d_preload_pages=h2d_preload_pages,
+                admission_nodes=admission_nodes,
             )
         )
         return device_indices
